@@ -3,7 +3,7 @@
 var protocol = require('./protocol');
 
 // Change this build-time value to the WebSocket server reachable by the phone.
-var WEBSOCKET_URL = 'ws://192.168.1.100:8080/';
+var WEBSOCKET_URL = 'ws://192.168.50.199:8080/';
 var HANDOFF_TIMEOUT_MS = 1000;
 var ACK_TIMEOUT_MS = 1000;
 

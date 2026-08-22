@@ -1,0 +1,6 @@
+* text=auto
+
+.envrc text eol=lf
+*.nix text eol=lf
+gitman.yml text eol=lf
+pixi.toml text eol=lf
