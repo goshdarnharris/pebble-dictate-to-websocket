@@ -22,7 +22,7 @@ import inspect
 import json
 import logging
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Dict, Optional, Union
+from typing import AsyncIterator, Awaitable, Callable, Dict, Optional, Union
 
 from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
@@ -197,32 +197,26 @@ async def _dispatch_message(
     handler: MessageHandler,
     message: DictationMessage,
 ) -> bool:
+    if not await _send_payload(
+        connection,
+        acknowledgement_payload(message.request_id),
+    ):
+        return False
+
     try:
         result = handler(message)
         if inspect.isawaitable(result):
             await result
         elif result is not None:
             raise TypeError("dictation handler must return None or an awaitable")
-    except DictationRejected as error:
-        return await _send_payload(
-            connection,
-            error_payload(message.request_id, error.code),
-        )
     except Exception as error:
         LOGGER.error(
-            "Dictation handler failed for %s (%s)",
+            "Delivered dictation handler failed for %s (%s)",
             message.request_id,
             type(error).__name__,
         )
-        return await _send_payload(
-            connection,
-            error_payload(message.request_id, "internal_error"),
-        )
 
-    return await _send_payload(
-        connection,
-        acknowledgement_payload(message.request_id),
-    )
+    return True
 
 
 async def _handle_connection(
@@ -280,6 +274,37 @@ async def start_server(
         port,
         max_size=max_size,
     )
+
+
+async def dictation_messages(
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    *,
+    max_size: int = DEFAULT_MAX_SIZE,
+) -> AsyncIterator[DictationMessage]:
+    """Yield delivered dictation messages until iteration is closed.
+
+    The server is started when iteration begins and closed when the generator
+    is closed. Each valid message is acknowledged before it is yielded.
+    """
+
+    messages: asyncio.Queue[DictationMessage] = asyncio.Queue()
+
+    def enqueue(message: DictationMessage) -> None:
+        messages.put_nowait(message)
+
+    server = await start_server(
+        enqueue,
+        host,
+        port,
+        max_size=max_size,
+    )
+    try:
+        while True:
+            yield await messages.get()
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 async def serve_forever(

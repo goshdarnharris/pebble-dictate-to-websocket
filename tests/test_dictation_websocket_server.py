@@ -1,4 +1,6 @@
+import asyncio
 import json
+import socket
 import unittest
 
 from websockets.asyncio.client import connect
@@ -9,6 +11,7 @@ from dictation_websocket_server import (
     DictationProtocolError,
     DictationRejected,
     acknowledgement_payload,
+    dictation_messages,
     error_payload,
     parse_dictation_message,
     start_server,
@@ -136,6 +139,29 @@ class DictationServerTest(unittest.IsolatedAsyncioTestCase):
             [DictationMessage(REQUEST_ID, "accepted")],
         )
 
+    async def test_acknowledges_before_handler_completes(self):
+        handler_started = asyncio.Event()
+        allow_handler_to_finish = asyncio.Event()
+
+        async def handler(message):
+            self.messages.append(message)
+            handler_started.set()
+            await allow_handler_to_finish.wait()
+
+        self.server.close()
+        await self.server.wait_closed()
+        self.server = await start_server(handler, host="127.0.0.1", port=0)
+        self.port = self.server.sockets[0].getsockname()[1]
+        self.uri = "ws://127.0.0.1:{}".format(self.port)
+
+        async with connect(self.uri) as websocket:
+            await websocket.send(json.dumps(request_payload("accepted")))
+            response = json.loads(await websocket.recv())
+            await handler_started.wait()
+
+        self.assertEqual(response, acknowledgement_payload(REQUEST_ID))
+        allow_handler_to_finish.set()
+
     async def test_sends_correlated_protocol_error(self):
         payload = request_payload()
         payload["type"] = "other"
@@ -149,20 +175,12 @@ class DictationServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["code"], "invalid_type")
         self.assertEqual(self.messages, [])
 
-    async def test_sends_application_rejection(self):
+    async def test_acknowledges_application_rejection(self):
         async with connect(self.uri) as websocket:
             await websocket.send(json.dumps(request_payload("reject")))
             response = json.loads(await websocket.recv())
 
-        self.assertEqual(
-            response,
-            {
-                "version": 1,
-                "type": "error",
-                "requestId": REQUEST_ID,
-                "code": "not_allowed",
-            },
-        )
+        self.assertEqual(response, acknowledgement_payload(REQUEST_ID))
         self.assertEqual(self.messages, [])
 
     async def test_closes_uncorrelated_invalid_request(self):
@@ -172,6 +190,31 @@ class DictationServerTest(unittest.IsolatedAsyncioTestCase):
                 await websocket.recv()
 
         self.assertEqual(raised.exception.rcvd.code, 1008)
+
+
+class DictationMessageGeneratorTest(unittest.IsolatedAsyncioTestCase):
+    async def test_yields_message_after_acknowledgement(self):
+        with socket.socket() as socket_probe:
+            socket_probe.bind(("127.0.0.1", 0))
+            port = socket_probe.getsockname()[1]
+
+        messages = dictation_messages(host="127.0.0.1", port=port)
+        next_message = asyncio.ensure_future(messages.__anext__())
+        await asyncio.sleep(0.01)
+
+        try:
+            async with connect("ws://127.0.0.1:{}".format(port)) as websocket:
+                await websocket.send(json.dumps(request_payload("streamed")))
+                response = json.loads(await websocket.recv())
+                message = await next_message
+
+            self.assertEqual(response, acknowledgement_payload(REQUEST_ID))
+            self.assertEqual(
+                message,
+                DictationMessage(REQUEST_ID, "streamed"),
+            )
+        finally:
+            await messages.aclose()
 
 
 if __name__ == "__main__":

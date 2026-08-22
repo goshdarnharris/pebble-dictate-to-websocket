@@ -25,8 +25,8 @@ The server must reply within one second with a matching acknowledgement:
 ## Run the example server
 
 The single-file `dictation_websocket_server.py` module parses the application's
-JSON requests and sends the required acknowledgement after a handler accepts a
-message.
+JSON requests and immediately acknowledges each valid message before delivering
+it to application code.
 
 Start its command-line server on port 8080:
 
@@ -53,9 +53,21 @@ run_server(handle, host="0.0.0.0", port=8080)
 ```
 
 The callback may be synchronous or asynchronous. Returning normally sends an
-`ack`. Raising `DictationRejected("code")` sends a correlated application
-error. Other callback exceptions are logged without transcript content and
-return `internal_error`.
+`ack` before the callback is invoked. Callback exceptions are logged without
+transcript content; they cannot change the response because the message is
+already delivered.
+
+For generator-oriented applications, consume `dictation_messages()` as an
+async generator. It starts the server when iteration begins and closes it when
+the generator is closed:
+
+```python
+from dictation_websocket_server import dictation_messages
+
+
+async for message in dictation_messages(host="0.0.0.0", port=8080):
+  process(message.transcript)
+```
 
 ## Build and test
 
