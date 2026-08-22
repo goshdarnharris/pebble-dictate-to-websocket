@@ -1,0 +1,38 @@
+{
+  "name": "pebble-dictate-to-websocket",
+  "author": "Pebble Dictate to WebSocket contributors",
+  "version": "0.1.0",
+  "keywords": [
+    "pebble-app"
+  ],
+  "private": true,
+  "scripts": {
+    "test": "node tests/pkjs/protocol.test.js"
+  },
+  "dependencies": {},
+  "pebble": {
+    "displayName": "Dictate WS",
+    "uuid": "45be3424-4406-444e-8878-adc999bc479e",
+    "sdkVersion": "3",
+    "enableMultiJS": true,
+    "targetPlatforms": [
+      "emery"
+    ],
+    "watchapp": {
+      "watchface": false
+    },
+    "messageKeys": {
+      "PROTOCOL_VERSION": 0,
+      "MESSAGE_TYPE": 1,
+      "REQUEST_ID": 2,
+      "CHUNK_INDEX": 3,
+      "CHUNK_COUNT": 4,
+      "TOTAL_BYTES": 5,
+      "CHUNK_TEXT": 6,
+      "STATUS_CODE": 7
+    },
+    "resources": {
+      "media": []
+    }
+  }
+}
