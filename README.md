@@ -1,36 +1,79 @@
-# dictate-to-websocket
+# Pebble Dictate to WebSocket
 
-A Pebble watchapp/watchface written in C using the Pebble SDK.
+A Pebble Time 2 watchapp that starts native dictation on launch and forwards the
+complete transcript through PebbleKit JS to a WebSocket server.
 
-## Building & running
+See [the functional specification](docs/functional-specification.md) for the
+interaction and protocol contracts.
+
+## Configure
+
+Set `WEBSOCKET_URL` near the top of `src/pkjs/index.js` to a `ws://` or `wss://`
+endpoint reachable by the phone. The checked-in value is an example local
+network address and must be changed for the deployment network.
+
+The server must reply within one second with a matching acknowledgement:
+
+```json
+{
+  "version": 1,
+  "type": "ack",
+  "requestId": "1a2b3c4d"
+}
+```
+
+## Run the example server
+
+The single-file `dictation_websocket_server.py` module parses the application's
+JSON requests and sends the required acknowledgement after a handler accepts a
+message.
+
+Start its command-line server on port 8080:
 
 ```sh
-pebble build                          # build for all targetPlatforms
-pebble install --emulator emery       # install on the emery emulator
-pebble install --phone <ip>           # install to a paired phone
+pixi run server
 ```
 
-## Target platforms
+The CLI binds to all interfaces and prints each accepted message as JSON. Set
+`WEBSOCKET_URL` to `ws://<computer-lan-address>:8080/` so the phone can reach
+it. The server has no authentication and should only be exposed on a trusted
+network.
 
-`targetPlatforms` in `package.json` controls which watches you build for. The
-modern Pebble hardware is **emery** (Pebble Time 2), **gabbro** (Pebble Round
-2), and **flint** (Pebble 2 Duo); the original Pebble platforms (aplite,
-basalt, chalk, diorite) are included by default for backwards compatibility.
+It can also be imported:
 
-## Project layout
+```python
+from dictation_websocket_server import DictationMessage, run_server
 
+
+def handle(message: DictationMessage) -> None:
+    process(message.transcript)
+
+
+run_server(handle, host="0.0.0.0", port=8080)
 ```
-src/c/           C source for the watchapp
-src/pkjs/        PebbleKit JS (phone-side) source, if any
-worker_src/c/    Background worker source, if any
-resources/       Images, fonts, and other bundled resources
-package.json     Project metadata (UUID, platforms, resources, message keys)
-wscript          Build rules — usually no need to edit
+
+The callback may be synchronous or asynchronous. Returning normally sends an
+`ack`. Raising `DictationRejected("code")` sends a correlated application
+error. Other callback exceptions are logged without transcript content and
+return `internal_error`.
+
+## Build and test
+
+Enter the repository's Nix development environment, then run:
+
+```sh
+npm test
+pebble build
+pixi run test-server
 ```
 
-By default this project is configured as a watchapp. To make it a watchface,
-set `pebble.watchapp.watchface` to `true` in `package.json`.
+Install on an `emery` emulator for UI and lifecycle smoke testing:
 
-## Documentation
+```sh
+pebble install --emulator emery
+pebble logs --emulator emery
+```
 
-Full SDK docs, tutorials, and API reference: <https://developer.repebble.com>
+Native dictation and the complete network flow require a physical Pebble Time
+2, a connected phone running the Pebble app, and the configured WebSocket
+server.
