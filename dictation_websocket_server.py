@@ -364,10 +364,10 @@ class DictationExchange:
             asyncio.get_running_loop().create_future()
         )
 
-    def respond(self, result: ServerResult) -> None:
+    def respond(self, success: bool, response: str = "") -> None:
         if self._response.done():
             raise RuntimeError("dictation exchange already resolved")
-        self._response.set_result(_validate_server_result(result))
+        self._response.set_result(ServerResult(success=success, response=response))
 
     async def wait_for_response(self) -> ServerResult:
         return await self._response
