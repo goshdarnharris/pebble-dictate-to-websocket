@@ -1,6 +1,8 @@
 'use strict';
 
-var VERSION = 1;
+var VERSION = 2;
+var MAX_RESPONSE_BYTES = 1024;
+var RESPONSE_CHUNK_BYTES = 256;
 
 var KEYS = {
   PROTOCOL_VERSION: 'PROTOCOL_VERSION',
@@ -10,7 +12,8 @@ var KEYS = {
   CHUNK_COUNT: 'CHUNK_COUNT',
   TOTAL_BYTES: 'TOTAL_BYTES',
   CHUNK_TEXT: 'CHUNK_TEXT',
-  STATUS_CODE: 'STATUS_CODE'
+  STATUS_CODE: 'STATUS_CODE',
+  SERVER_SUCCESS: 'SERVER_SUCCESS'
 };
 
 var MESSAGE_TYPES = {
@@ -18,8 +21,8 @@ var MESSAGE_TYPES = {
   TRANSCRIPT_CHUNK: 2,
   SESSION_END: 3,
   SEND_STARTED: 10,
-  REMOTE_ACK: 11,
-  FAILURE: 12
+  FAILURE: 12,
+  SERVER_RESULT_CHUNK: 13
 };
 
 var STATUS_CODES = {
@@ -31,9 +34,10 @@ var STATUS_CODES = {
   ERROR_PROTOCOL: 5,
   ERROR_TRANSFER: 6,
   ERROR_SERVER: 7,
-  ERROR_ACK_TIMEOUT: 8,
+  ERROR_SERVER_RESULT_TIMEOUT: 8,
   ERROR_TRANSCRIPT_DELIVERY_TIMEOUT: 9,
   ERROR_WS_REQUEST_TIMEOUT: 10,
+  ERROR_RESULT_TRANSFER_TIMEOUT: 11,
 };
 
 function protocolError(message) {
@@ -133,7 +137,7 @@ function parseWatchMessage(payload) {
     utf8ByteLength(message.chunkText);
   } else if (type === MESSAGE_TYPES.SESSION_END) {
     message.statusCode = requireUint32(payload, KEYS.STATUS_CODE);
-    if (message.statusCode > STATUS_CODES.ERROR_WS_REQUEST_TIMEOUT) {
+    if (message.statusCode > STATUS_CODES.ERROR_RESULT_TRANSFER_TIMEOUT) {
       throw protocolError('Invalid status code');
     }
   } else if (type !== MESSAGE_TYPES.SESSION_BEGIN) {
@@ -216,6 +220,66 @@ function buildRequest(requestId, transcript) {
   };
 }
 
+function splitUtf8(text, maxChunkBytes) {
+  var totalBytes = utf8ByteLength(text);
+  if (totalBytes > MAX_RESPONSE_BYTES) {
+    throw protocolError('Server response is too large');
+  }
+  if (!isUint32(maxChunkBytes) || maxChunkBytes === 0) {
+    throw protocolError('Invalid response chunk size');
+  }
+
+  var chunks = [];
+  var chunk = '';
+  var chunkBytes = 0;
+  for (var i = 0; i < text.length; i++) {
+    var end = i + 1;
+    var code = text.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      end++;
+    }
+    var character = text.substring(i, end);
+    var characterBytes = utf8ByteLength(character);
+    if (characterBytes > maxChunkBytes) {
+      throw protocolError('Response chunk size cannot hold one character');
+    }
+    if (chunkBytes > 0 && chunkBytes + characterBytes > maxChunkBytes) {
+      chunks.push(chunk);
+      chunk = '';
+      chunkBytes = 0;
+    }
+    chunk += character;
+    chunkBytes += characterBytes;
+    i = end - 1;
+  }
+  chunks.push(chunk);
+  return chunks;
+}
+
+function buildServerResultChunks(requestId, success, response) {
+  if (!isRequestId(requestId) || typeof success !== 'boolean' ||
+      typeof response !== 'string') {
+    throw protocolError('Cannot build server result chunks');
+  }
+
+  var totalBytes = utf8ByteLength(response);
+  var chunks = splitUtf8(response, RESPONSE_CHUNK_BYTES);
+  var payloads = [];
+  for (var i = 0; i < chunks.length; i++) {
+    var payload = {};
+    payload[KEYS.PROTOCOL_VERSION] = VERSION;
+    payload[KEYS.MESSAGE_TYPE] = MESSAGE_TYPES.SERVER_RESULT_CHUNK;
+    payload[KEYS.REQUEST_ID] = requestId;
+    payload[KEYS.CHUNK_INDEX] = i;
+    payload[KEYS.CHUNK_COUNT] = chunks.length;
+    payload[KEYS.TOTAL_BYTES] = totalBytes;
+    payload[KEYS.CHUNK_TEXT] = chunks[i];
+    payload[KEYS.SERVER_SUCCESS] = success ? 1 : 0;
+    payloads.push(payload);
+  }
+  return payloads;
+}
+
 function parseServerFrame(data, requestId) {
   if (typeof data !== 'string' || !isRequestId(requestId)) {
     return {
@@ -234,16 +298,15 @@ function parseServerFrame(data, requestId) {
 
   if (!message ||
       Object.prototype.toString.call(message) !== '[object Object]' ||
-      message.version !== VERSION ||
       message.requestId !== requestId) {
     return {
       kind: 'unrelated'
     };
   }
 
-  if (message.type === 'ack') {
+  if (message.version !== VERSION) {
     return {
-      kind: 'ack'
+      kind: 'protocol_error'
     };
   }
 
@@ -251,25 +314,48 @@ function parseServerFrame(data, requestId) {
       typeof message.code === 'string' &&
       message.code.length > 0) {
     return {
-      kind: 'error',
+      kind: 'server_error',
       code: message.code
     };
   }
 
+  if (message.type === 'result') {
+    if (typeof message.success !== 'boolean' ||
+        typeof message.response !== 'string') {
+      return {kind: 'protocol_error'};
+    }
+    try {
+      if (utf8ByteLength(message.response) > MAX_RESPONSE_BYTES) {
+        return {kind: 'protocol_error'};
+      }
+    } catch (error) {
+      return {kind: 'protocol_error'};
+    }
+    return {
+      kind: 'result',
+      success: message.success,
+      response: message.response
+    };
+  }
+
   return {
-    kind: 'unrelated'
+    kind: 'protocol_error'
   };
 }
 
 module.exports = {
   VERSION: VERSION,
+  MAX_RESPONSE_BYTES: MAX_RESPONSE_BYTES,
+  RESPONSE_CHUNK_BYTES: RESPONSE_CHUNK_BYTES,
   KEYS: KEYS,
   MESSAGE_TYPES: MESSAGE_TYPES,
   STATUS_CODES: STATUS_CODES,
   ProtocolError: protocolError,
   TranscriptAssembler: TranscriptAssembler,
   buildRequest: buildRequest,
+  buildServerResultChunks: buildServerResultChunks,
   parseServerFrame: parseServerFrame,
   parseWatchMessage: parseWatchMessage,
+  splitUtf8: splitUtf8,
   utf8ByteLength: utf8ByteLength
 };

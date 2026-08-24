@@ -6,10 +6,11 @@ Run the example server with:
 
 Or provide an application callback:
 
-    from dictation_websocket_server import DictationMessage, run_server
+    from dictation_websocket_server import ServerResult, run_server
 
-    def handle(message: DictationMessage) -> None:
+    def handle(message: DictationMessage) -> ServerResult:
         process(message.transcript)
+        return ServerResult(success=True, response="Accepted")
 
     run_server(handle, host="0.0.0.0", port=8080)
 """
@@ -22,12 +23,14 @@ import inspect
 import json
 import logging
 from dataclasses import dataclass
-from typing import AsyncIterator, Awaitable, Callable, Dict, Optional, Union
+from enum import Enum, auto
+from typing import AsyncIterator, Awaitable, Callable, Dict, Optional, Set, Union
 
 from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
+MAX_RESPONSE_BYTES = 1024
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
 DEFAULT_MAX_SIZE = 1024 * 1024
@@ -41,6 +44,14 @@ class DictationMessage:
 
     request_id: str
     transcript: str
+
+
+@dataclass(frozen=True)
+class ServerResult:
+    """One application-level result returned to the watch."""
+
+    success: bool
+    response: str
 
 
 class DictationProtocolError(ValueError):
@@ -57,8 +68,37 @@ class DictationProtocolError(ValueError):
         self.request_id = request_id
 
 
+class BridgeState(Enum):
+    """Lifecycle of one validated WebSocket-to-handler request."""
 
-HandlerResult = Optional[Awaitable[None]]
+    RECEIVED = auto()
+    DISPATCHING = auto()
+    SENDING_RESULT = auto()
+    COMPLETE = auto()
+    FAILED = auto()
+
+
+class BridgeError(Enum):
+    """Failure owned by the WebSocket-to-handler bridge."""
+
+    NONE = auto()
+    PROTOCOL = auto()
+    SEND = auto()
+    HANDLER = auto()
+    HANDLER_RESULT = auto()
+
+
+@dataclass
+class BridgeSession:
+    """State and most recent error for one validated request."""
+
+    message: DictationMessage
+    state: BridgeState = BridgeState.RECEIVED
+    error: BridgeError = BridgeError.NONE
+
+
+
+HandlerResult = Union[ServerResult, Awaitable[ServerResult]]
 MessageHandler = Callable[[DictationMessage], HandlerResult]
 
 
@@ -110,10 +150,13 @@ def parse_dictation_message(frame: Union[str, bytes]) -> DictationMessage:
     raw_request_id = payload.get("requestId")
     request_id = raw_request_id if _is_request_id(raw_request_id) else None
 
-    if type(payload.get("version")) is not int or payload["version"] != 1:
+    if (
+        type(payload.get("version")) is not int
+        or payload["version"] != PROTOCOL_VERSION
+    ):
         raise DictationProtocolError(
             "unsupported_version",
-            "dictation request version must be 1",
+            f"dictation request version must be {PROTOCOL_VERSION}",
             request_id,
         )
 
@@ -141,15 +184,37 @@ def parse_dictation_message(frame: Union[str, bytes]) -> DictationMessage:
     return DictationMessage(request_id=request_id, transcript=transcript)
 
 
-def acknowledgement_payload(request_id: str) -> Dict[str, object]:
-    """Build the protocol acknowledgement object for a request."""
+def _validate_server_result(result: object) -> ServerResult:
+    if not isinstance(result, ServerResult):
+        raise TypeError("dictation handler must return ServerResult")
+    if type(result.success) is not bool:
+        raise ValueError("server result success must be a boolean")
+    if not isinstance(result.response, str):
+        raise ValueError("server result response must be a string")
+    try:
+        response_bytes = len(result.response.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise ValueError("server result response must be valid UTF-8") from error
+    if response_bytes > MAX_RESPONSE_BYTES:
+        raise ValueError("server result response exceeds 1024 UTF-8 bytes")
+    return result
+
+
+def result_payload(
+    request_id: str,
+    result: ServerResult,
+) -> Dict[str, object]:
+    """Build one correlated final result object."""
 
     if not _is_request_id(request_id):
         raise ValueError("invalid request ID")
+    validated = _validate_server_result(result)
     return {
         "version": PROTOCOL_VERSION,
-        "type": "ack",
+        "type": "result",
         "requestId": request_id,
+        "success": validated.success,
+        "response": validated.response,
     }
 
 
@@ -188,56 +253,128 @@ async def _dispatch_message(
     handler: MessageHandler,
     message: DictationMessage,
 ) -> bool:
-    if not await _send_payload(
-        connection,
-        acknowledgement_payload(message.request_id),
-    ):
-        return False
+    bridge = DictationWebSocketBridge(connection, handler)
+    return await bridge.dispatch(BridgeSession(message))
 
-    try:
-        result = handler(message)
-        if inspect.isawaitable(result):
-            await result
-        elif result is not None:
-            raise TypeError("dictation handler must return None or an awaitable")
-    except Exception as error:
-        LOGGER.error(
-            "Delivered dictation handler failed for %s (%s)",
-            message.request_id,
-            type(error).__name__,
-        )
 
-    return True
+class DictationWebSocketBridge:
+    """Own protocol, handler, and final-result dispatch for a connection."""
+
+    def __init__(
+        self,
+        connection: ServerConnection,
+        handler: MessageHandler,
+    ) -> None:
+        self.connection = connection
+        self.handler = handler
+        self.last_error = BridgeError.NONE
+        self.last_session: Optional[BridgeSession] = None
+
+    async def handle_frame(self, frame: Union[str, bytes]) -> bool:
+        try:
+            message = parse_dictation_message(frame)
+        except DictationProtocolError as error:
+            self.last_error = BridgeError.PROTOCOL
+            LOGGER.info("Rejected dictation frame: %s", error.code)
+            if error.request_id is None:
+                await self.connection.close(code=1008, reason=error.code)
+                return False
+            return await _send_payload(
+                self.connection,
+                error_payload(error.request_id, error.code),
+            )
+
+        session = BridgeSession(message)
+        self.last_session = session
+        return await self.dispatch(session)
+
+    async def dispatch(self, session: BridgeSession) -> bool:
+        try:
+            session.state = BridgeState.DISPATCHING
+            result = self.handler(session.message)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as error:
+            session.state = BridgeState.FAILED
+            session.error = BridgeError.HANDLER
+            self.last_error = session.error
+            LOGGER.error(
+                "Delivered dictation handler failed for %s (%s)",
+                session.message.request_id,
+                type(error).__name__,
+            )
+            return await _send_payload(
+                self.connection,
+                error_payload(session.message.request_id, "handler_error"),
+            )
+
+        try:
+            payload = result_payload(session.message.request_id, result)
+        except (TypeError, ValueError) as error:
+            session.state = BridgeState.FAILED
+            session.error = BridgeError.HANDLER_RESULT
+            self.last_error = session.error
+            LOGGER.error(
+                "Dictation handler returned an invalid result for %s (%s)",
+                session.message.request_id,
+                type(error).__name__,
+            )
+            return await _send_payload(
+                self.connection,
+                error_payload(
+                    session.message.request_id,
+                    "invalid_handler_result",
+                ),
+            )
+
+        session.state = BridgeState.SENDING_RESULT
+        if not await _send_payload(self.connection, payload):
+            session.state = BridgeState.FAILED
+            session.error = BridgeError.SEND
+            self.last_error = session.error
+            return False
+        session.state = BridgeState.COMPLETE
+        return True
 
 
 async def _handle_connection(
     connection: ServerConnection,
     handler: MessageHandler,
 ) -> None:
+    bridge = DictationWebSocketBridge(connection, handler)
     try:
         async for frame in connection:
-            try:
-                message = parse_dictation_message(frame)
-            except DictationProtocolError as error:
-                LOGGER.info("Rejected dictation frame: %s", error.code)
-                if error.request_id is None:
-                    await connection.close(code=1008, reason=error.code)
-                    return
-                if not await _send_payload(
-                    connection,
-                    error_payload(error.request_id, error.code),
-                ):
-                    return
-                continue
-
-            if not await _dispatch_message(connection, handler, message):
+            if not await bridge.handle_frame(frame):
                 return
     except ConnectionClosed:
         return
 
 
-def _accept_message(message: DictationMessage) -> None:
+def _accept_message(message: DictationMessage) -> ServerResult:
     del message
+    return ServerResult(success=True, response="Accepted")
+
+
+class DictationExchange:
+    """A yielded dictation request awaiting one application response."""
+
+    def __init__(self, message: DictationMessage) -> None:
+        self.message = message
+        self._response: asyncio.Future[ServerResult] = (
+            asyncio.get_running_loop().create_future()
+        )
+
+    def respond(self, result: ServerResult) -> None:
+        if self._response.done():
+            raise RuntimeError("dictation exchange already resolved")
+        self._response.set_result(_validate_server_result(result))
+
+    async def wait_for_response(self) -> ServerResult:
+        return await self._response
+
+    def cancel(self) -> None:
+        if not self._response.done():
+            self._response.cancel()
 
 
 async def start_server(
@@ -272,17 +409,23 @@ async def dictation_messages(
     port: int = DEFAULT_PORT,
     *,
     max_size: int = DEFAULT_MAX_SIZE,
-) -> AsyncIterator[DictationMessage]:
-    """Yield delivered dictation messages until iteration is closed.
+) -> AsyncIterator[DictationExchange]:
+    """Yield dictation exchanges until iteration is closed.
 
-    The server is started when iteration begins and closed when the generator
-    is closed. Each valid message is acknowledged before it is yielded.
+    Each exchange must receive exactly one `ServerResult` through `respond()`.
     """
 
-    messages: asyncio.Queue[DictationMessage] = asyncio.Queue()
+    exchanges: asyncio.Queue[DictationExchange] = asyncio.Queue()
+    pending: Set[DictationExchange] = set()
 
-    def enqueue(message: DictationMessage) -> None:
-        messages.put_nowait(message)
+    async def enqueue(message: DictationMessage) -> ServerResult:
+        exchange = DictationExchange(message)
+        pending.add(exchange)
+        exchanges.put_nowait(exchange)
+        try:
+            return await exchange.wait_for_response()
+        finally:
+            pending.discard(exchange)
 
     server = await start_server(
         enqueue,
@@ -292,8 +435,10 @@ async def dictation_messages(
     )
     try:
         while True:
-            yield await messages.get()
+            yield await exchanges.get()
     finally:
+        for exchange in pending:
+            exchange.cancel()
         server.close()
         await server.wait_closed()
 
@@ -339,7 +484,7 @@ def run_server(
     )
 
 
-def _print_message(message: DictationMessage) -> None:
+def _print_message(message: DictationMessage) -> ServerResult:
     print(
         json.dumps(
             {
@@ -350,11 +495,12 @@ def _print_message(message: DictationMessage) -> None:
         ),
         flush=True,
     )
+    return ServerResult(success=True, response="Accepted")
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Receive and acknowledge Pebble Dictate WS messages.",
+        description="Receive and respond to Pebble Dictate WS messages.",
     )
     parser.add_argument(
         "--host",

@@ -117,7 +117,7 @@ function testRequestShape() {
   assert.deepStrictEqual(
       protocol.buildRequest(REQUEST_ID, 'example'),
       {
-        version: 1,
+        version: 2,
         type: 'dictation',
         requestId: REQUEST_ID,
         transcript: 'example'
@@ -128,35 +128,41 @@ function testServerFrames() {
   assert.deepStrictEqual(
       protocol.parseServerFrame(
           JSON.stringify({
-            version: 1,
-            type: 'ack',
-            requestId: REQUEST_ID
+            version: 2,
+            type: 'result',
+            requestId: REQUEST_ID,
+            success: true,
+            response: 'accepted'
           }),
           REQUEST_ID),
-      {kind: 'ack'});
+      {kind: 'result', success: true, response: 'accepted'});
 
   assert.deepStrictEqual(
       protocol.parseServerFrame(
           JSON.stringify({
-            version: 1,
+            version: 2,
             type: 'error',
             requestId: REQUEST_ID,
             code: 'invalid_request'
           }),
           REQUEST_ID),
-      {kind: 'error', code: 'invalid_request'});
+      {kind: 'server_error', code: 'invalid_request'});
+
+  assert.deepStrictEqual(
+      protocol.parseServerFrame(
+          JSON.stringify({
+            version: 2,
+            type: 'result',
+            requestId: REQUEST_ID,
+            success: false,
+            response: 'not accepted'
+          }),
+          REQUEST_ID),
+      {kind: 'result', success: false, response: 'not accepted'});
 
   var unrelatedFrames = [
     'not json',
-    JSON.stringify({version: 2, type: 'ack', requestId: REQUEST_ID}),
-    JSON.stringify({version: 1, type: 'ack', requestId: 'ffffffff'}),
-    JSON.stringify({version: 1, type: 'unknown', requestId: REQUEST_ID}),
-    JSON.stringify({
-      version: 1,
-      type: 'error',
-      requestId: REQUEST_ID,
-      code: ''
-    }),
+    JSON.stringify({version: 2, type: 'result', requestId: 'ffffffff'}),
     Buffer.from('binary')
   ];
 
@@ -165,6 +171,68 @@ function testServerFrames() {
         protocol.parseServerFrame(frame, REQUEST_ID),
         {kind: 'unrelated'});
   });
+
+  var malformedCorrelatedFrames = [
+    JSON.stringify({version: 1, type: 'result', requestId: REQUEST_ID}),
+    JSON.stringify({version: 2, type: 'unknown', requestId: REQUEST_ID}),
+    JSON.stringify({
+      version: 2,
+      type: 'error',
+      requestId: REQUEST_ID,
+      code: ''
+    }),
+    JSON.stringify({
+      version: 2,
+      type: 'result',
+      requestId: REQUEST_ID,
+      success: 1,
+      response: 'invalid'
+    }),
+    JSON.stringify({
+      version: 2,
+      type: 'result',
+      requestId: REQUEST_ID,
+      success: true,
+      response: new Array(1026).join('x')
+    })
+  ];
+
+  malformedCorrelatedFrames.forEach(function(frame) {
+    assert.deepStrictEqual(
+        protocol.parseServerFrame(frame, REQUEST_ID),
+        {kind: 'protocol_error'});
+  });
+}
+
+function testServerResultChunks() {
+  var response = new Array(255).join('a') + '\ud83d\ude80' + 'tail';
+  var payloads = protocol.buildServerResultChunks(
+      REQUEST_ID, false, response);
+
+  assert.strictEqual(payloads.length, 2);
+  assert.strictEqual(
+      protocol.utf8ByteLength(payloads[0][protocol.KEYS.CHUNK_TEXT]),
+      254);
+  assert.strictEqual(payloads[1][protocol.KEYS.CHUNK_TEXT], '\ud83d\ude80tail');
+  assert.strictEqual(payloads[0][protocol.KEYS.SERVER_SUCCESS], 0);
+  assert.strictEqual(payloads[0][protocol.KEYS.CHUNK_COUNT], 2);
+  assert.strictEqual(
+      payloads[0][protocol.KEYS.TOTAL_BYTES],
+      protocol.utf8ByteLength(response));
+
+  var empty = protocol.buildServerResultChunks(REQUEST_ID, true, '');
+  assert.strictEqual(empty.length, 1);
+  assert.strictEqual(empty[0][protocol.KEYS.CHUNK_TEXT], '');
+  assert.strictEqual(empty[0][protocol.KEYS.TOTAL_BYTES], 0);
+
+  var maximum = new Array(1025).join('x');
+  assert.strictEqual(
+      protocol.buildServerResultChunks(REQUEST_ID, true, maximum).length,
+      4);
+  assert.throws(function() {
+    protocol.buildServerResultChunks(
+        REQUEST_ID, true, maximum + 'x');
+  }, /too large/);
 }
 
 function testManifestMessageKeys() {
@@ -176,9 +244,11 @@ function testManifestMessageKeys() {
     CHUNK_COUNT: 4,
     TOTAL_BYTES: 5,
     CHUNK_TEXT: 6,
-    STATUS_CODE: 7
+    STATUS_CODE: 7,
+    SERVER_SUCCESS: 8
   });
   assert.deepStrictEqual(packageManifest.pebble.targetPlatforms, ['emery']);
+  assert.strictEqual(packageManifest.pebble.sdkVersion, '3');
 }
 
 testSingleChunk();
@@ -188,6 +258,7 @@ testInvalidUtf16();
 testWatchMessageParsing();
 testRequestShape();
 testServerFrames();
+testServerResultChunks();
 testManifestMessageKeys();
 
 console.log('All PebbleKit JS protocol tests passed.');

@@ -15,8 +15,10 @@ The intended interaction is:
 4. The watchapp transfers the complete transcription to PebbleKit JS.
 5. PebbleKit JS sends the transcription to a build-time-configured WebSocket
    endpoint.
-6. The remote server acknowledges the transcription.
-7. The watchapp closes.
+6. The remote server returns a correlated application result.
+7. PebbleKit JS transfers the result to the watchapp.
+8. The watchapp displays the result for three seconds and closes unless the
+  user interacts with it.
 
 The first version prioritizes a short interaction, deterministic behavior, and
 no retained data.
@@ -66,7 +68,10 @@ alter the functional flow.
   screen.
 - Transfer of the complete UTF-8 transcription over one or more AppMessages.
 - A single WebSocket request per successful transcription.
-- A correlated, application-level server acknowledgement.
+- A correlated, application-level server result containing success/failure and
+  a UTF-8 response of at most 1,024 bytes.
+- Lossless transfer of the result back to the watch over one or more
+  AppMessages.
 - Strict, short timeouts and visible failures.
 - Deterministic cleanup after success, cancellation, or failure.
 
@@ -76,6 +81,7 @@ alter the functional flow.
 - Retry, offline queueing, persistence, or background delivery.
 - Custom audio capture or a replacement dictation UI.
 - Delivery of partial or deliberately truncated transcriptions.
+- Truncation of server responses; an oversized response is rejected instead.
 - Multiple simultaneous dictation requests.
 - WebSocket authentication or an application authorization protocol.
 - Server discovery on the local network.
@@ -99,9 +105,15 @@ The watchapp:
 - maps native dictation results to success, cancellation, or error;
 - divides a successful transcription into lossless AppMessage chunks;
 - sends those chunks sequentially;
-- waits for PebbleKit JS and remote-server status messages;
-- owns the user-visible state and terminal error display; and
+- waits for PebbleKit JS and remote-server events;
+- validates and reassembles server-result chunks;
+- owns the user-visible state and terminal result/error display; and
 - exits only at a terminal state.
+
+The watchapp represents the lifecycle with one aggregate bridge context. Its
+watch/phone and phone/server bridge records each own their state, last typed
+error, timeout duration values, and active timer handles. Top-level application
+state covers dictation and UI lifecycle and does not duplicate bridge progress.
 
 ### 5.2 PebbleKit JS
 
@@ -111,19 +123,29 @@ PebbleKit JS:
 - opens the configured WebSocket while dictation is in progress;
 - validates and reassembles transcript chunks;
 - sends exactly one JSON request after receiving the complete transcription;
-- accepts only a matching server acknowledgement as success;
-- reports send start, acknowledgement, or failure to the watchapp;
+- accepts only a matching final server result;
+- reports send start, ordered result chunks, or bridge failure to the watchapp;
 - performs no retry and retains no completed transcription; and
 - closes the request's WebSocket when the request reaches a terminal state.
+
+PebbleKit JS implements a watch bridge and WebSocket bridge under one request
+coordinator. The watch bridge owns transcript assembly and serialized
+AppMessage delivery. The WebSocket bridge owns socket state and its handoff and
+server-result timers. The coordinator alone routes events between them and
+maps typed bridge errors to numeric status codes.
 
 ### 5.3 Remote WebSocket server
 
 The server:
 
 - accepts the request JSON specified in section 9;
-- returns an acknowledgement on reception of valid dictation data
 - processes each request according to its own policy;
-- responds quickly enough to satisfy the remote acknowledgement deadline.
+- returns exactly one correlated final result after processing; and
+- responds quickly enough to satisfy the server-result deadline.
+
+The included Python server represents each request with a typed bridge session.
+Sync and async handlers return a `ServerResult`. The async-iterator API yields
+a one-shot exchange which application code resolves with `respond()`.
 
 Server-side deduplication is recommended but is outside the watchapp's
 responsibility.
@@ -136,8 +158,16 @@ responsibility.
 2. Native dictation appears immediately and handles listening and
    transcription.
 3. After a successful transcription, the watchapp shows `Sending...`.
-4. When the matching remote acknowledgement reaches the watch, the app closes
-   immediately. No additional success screen or user input is required.
+4. While the server processes the request, the watchapp continues to show
+  `Sending...` for up to the server-result deadline.
+5. The watch displays a `Success` or `Failure` heading and the server's response
+  for three seconds, then closes.
+
+The result body is vertically scrollable with the UP and DOWN buttons when it
+does not fit on the Emery display. Any result-screen button press cancels the
+three-second close timer. UP and DOWN retain their normal scrolling behavior
+while cancelling the timer; after cancellation, the user exits manually with
+BACK. An empty response is valid and displays an empty body.
 
 The app must not claim success based only on AppMessage delivery or a successful
 call to `WebSocket.send()`.
@@ -154,7 +184,8 @@ implementation must distinguish at least these user-facing categories:
 | Dictation error | `Dictation error` | Dictation is disabled, cannot be created, or cannot start |
 | Phone/voice connection | `Phone unavailable` | Native voice connectivity or initial AppMessage failure |
 | Delivery | `Delivery failed` | Chunk, WebSocket, protocol, server error, or bridge failure |
-| Timeout | `WS server timed out` | WebSocket acknowledgement deadline expires |
+| Server timeout | `WS server timed out` | Final server-result deadline expires |
+| Result transfer timeout | `Result timed out` | Phone-to-watch result chunks stall |
 
 Exact typography and layout are implementation details, but each message must
 fit on `emery` without scrolling. The three-second duration begins when the
@@ -225,17 +256,39 @@ three-second status, and closes. There is no automatic second dictation attempt.
 
 ### 7.4 State machine
 
-The watchapp has the following logical states:
+The watchapp has the following top-level application states:
 
 | State | Description | Valid next states |
 | --- | --- | --- |
 | `INITIALIZING` | Root window, AppMessage, request, and dictation are being created | `DICTATING`, `ERROR` |
-| `DICTATING` | Native dictation owns the foreground interaction | `TRANSFERRING`, `ERROR` |
-| `TRANSFERRING` | Transcript chunks are sent sequentially | `AWAITING_SEND_START`, `ERROR` |
-| `AWAITING_SEND_START` | Final chunk reached PebbleKit JS; transcript chunk watchdog is active | `AWAITING_SERVER_ACK`, `ERROR` |
-| `AWAITING_SERVER_ACK` | PebbleKit JS called `WebSocket.send()`; acknowledgement watchdog is active | `SUCCESS`, `ERROR` |
-| `SUCCESS` | Matching remote acknowledgement reached the watch | closed |
+| `DICTATING` | Native dictation owns the foreground interaction | `BRIDGING`, `ERROR` |
+| `BRIDGING` | One or both logical bridges are transferring or waiting | `DISPLAYING_RESULT`, `ERROR` |
+| `DISPLAYING_RESULT` | A complete success or failure result is visible; interaction cancels automatic close | closed |
 | `ERROR` | A status is visible for three seconds | closed |
+
+The watch/phone bridge owns these states:
+
+| State | Description |
+| --- | --- |
+| `IDLE` | AppMessage has not started the request |
+| `SESSION_BEGIN_PENDING` | `SESSION_BEGIN` is in the AppMessage outbox |
+| `READY` | The session begin message was delivered |
+| `TRANSFERRING` | Transcript chunks are being sent sequentially |
+| `AWAITING_SEND_START` | The final transcript chunk was delivered; the 2-second watchdog is active |
+| `AWAITING_RESULT` | `SEND_STARTED` arrived; no result chunk has arrived yet |
+| `RECEIVING_RESULT` | Ordered result chunks are being reassembled |
+| `COMPLETE` | The complete result is owned by the watch |
+| `FAILED` | A watch/phone bridge error has terminated the request |
+
+The phone/server bridge owns these states:
+
+| State | Description |
+| --- | --- |
+| `IDLE` | No remote request is being prepared |
+| `PREPARING` | PebbleKit JS is opening the socket or awaiting the transcript |
+| `AWAITING_RESULT` | `WebSocket.send()` succeeded and the final result is pending |
+| `COMPLETE` | The first validated result chunk proves the remote result reached PebbleKit JS |
+| `FAILED` | A phone/server bridge error has terminated the request |
 
 Unexpected events for the current state are ignored if they belong to another
 request. An event with the current request identifier but an invalid type or
@@ -243,8 +296,11 @@ sequence is a protocol failure.
 
 ### 7.5 Exit and cleanup
 
-On `SUCCESS`, the watchapp cancels timers, releases owned transcript and
-dictation resources, removes its window, and exits immediately.
+On a complete application result, the watchapp cancels bridge timers and
+retains the response while its layers use it. It closes after three seconds if
+there is no interaction. Any button press cancels automatic close; UP and DOWN
+continue to scroll, and BACK manually closes the app. Exit releases response,
+transcript, layer, timer, and dictation resources.
 
 On `ERROR`, cleanup may begin immediately, but the root window remains visible
 for the three-second error duration before the app exits.
@@ -257,7 +313,7 @@ it is not used to finalize successful dictation.
 
 ### 8.1 General rules
 
-- Protocol version: `1`.
+- Protocol version: `2`.
 - Only one request may be active.
 - The request identifier is an opaque, nonempty ASCII string and is identical
   in AppMessage and WebSocket messages.
@@ -272,7 +328,7 @@ it is not used to finalize successful dictation.
 
 | Numeric key | Name | Type | Meaning |
 | ---: | --- | --- | --- |
-| `0` | `PROTOCOL_VERSION` | integer | Must be `1` |
+| `0` | `PROTOCOL_VERSION` | integer | Must be `2` |
 | `1` | `MESSAGE_TYPE` | integer | Value from section 8.3 |
 | `2` | `REQUEST_ID` | C string | Active request identifier |
 | `3` | `CHUNK_INDEX` | integer | Zero-based chunk position |
@@ -280,6 +336,7 @@ it is not used to finalize successful dictation.
 | `5` | `TOTAL_BYTES` | integer | UTF-8 transcript bytes, excluding C terminator |
 | `6` | `CHUNK_TEXT` | C string | One valid UTF-8 transcript segment |
 | `7` | `STATUS_CODE` | integer | Failure or terminal reason code |
+| `8` | `SERVER_SUCCESS` | integer | Server result boolean encoded as exactly `0` or `1` |
 
 Required keys depend on message type. A required key with the wrong type,
 missing value, or out-of-range value is a protocol error.
@@ -292,11 +349,11 @@ missing value, or out-of-range value is a protocol error.
 | `2` | `TRANSCRIPT_CHUNK` | Watch to JS | version, type, request ID, chunk index, chunk count, total bytes, chunk text |
 | `3` | `SESSION_END` | Watch to JS | version, type, request ID, status code |
 | `10` | `SEND_STARTED` | JS to watch | version, type, request ID |
-| `11` | `REMOTE_ACK` | JS to watch | version, type, request ID |
 | `12` | `FAILURE` | JS to watch | version, type, request ID, status code |
+| `13` | `SERVER_RESULT_CHUNK` | JS to watch | version, type, request ID, chunk index, chunk count, total bytes, chunk text, server success |
 
 `SESSION_END` is a best-effort cleanup notification for a request that ends
-before remote acknowledgement. It does not require an application-level reply.
+before a complete server result. It does not require an application-level reply.
 
 ### 8.4 Chunking
 
@@ -343,6 +400,26 @@ Duplicate, missing, reordered, inconsistent, or malformed chunks terminate the
 request as a protocol failure. PebbleKit JS must not call `WebSocket.send()`
 until all validations succeed.
 
+### 8.6 Server-result chunking and reassembly
+
+PebbleKit JS transfers the final `response` back to the watch as
+`SERVER_RESULT_CHUNK` messages:
+
+1. The response is valid UTF-8 and contains at most 1,024 UTF-8 bytes.
+2. Each chunk contains at most 256 UTF-8 bytes and ends at a Unicode code-point
+  boundary.
+3. `CHUNK_INDEX` starts at `0` and increases by exactly one.
+4. `CHUNK_COUNT`, `TOTAL_BYTES`, and `SERVER_SUCCESS` are identical on every
+  chunk.
+5. An empty response is represented by one chunk with empty `CHUNK_TEXT` and
+  `TOTAL_BYTES` equal to `0`.
+6. PebbleKit JS waits for each AppMessage completion callback before sending
+  the next result chunk.
+
+The watch allocates only after validating the first chunk's metadata and the
+1,024-byte limit. It rejects missing, duplicated, reordered, inconsistent,
+oversized, or malformed UTF-8 chunks. It does not display a partial response.
+
 ## 9. WebSocket protocol
 
 ### 9.1 Connection lifecycle
@@ -370,7 +447,7 @@ The text frame is UTF-8 JSON with this exact required shape:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "type": "dictation",
   "requestId": "1a2b3c4d",
   "transcript": "Example transcription"
@@ -379,32 +456,41 @@ The text frame is UTF-8 JSON with this exact required shape:
 
 Rules:
 
-- `version` is the JSON number `1`.
+- `version` is the JSON number `2`.
 - `type` is the JSON string `"dictation"`.
 - `requestId` exactly equals the AppMessage request identifier.
 - `transcript` exactly equals the reconstructed transcription.
-- No additional metadata is required in version 1.
+- No additional metadata is required in version 2.
 
-### 9.3 Acknowledgement
+### 9.3 Final result
 
-Successful transcript reception is represented by:
+Successful application processing is represented by:
 
 ```json
 {
-  "version": 1,
-  "type": "ack",
-  "requestId": "1a2b3c4d"
+  "version": 2,
+  "type": "result",
+  "requestId": "1a2b3c4d",
+  "success": true,
+  "response": "Request accepted"
 }
 ```
 
-The acknowledgement must be a WebSocket text frame containing valid JSON. It
-counts only while PebbleKit JS is awaiting a response and only when `version`,
-`type`, and `requestId` exactly match the active request. Additional object
-properties are ignored.
+An application-level failure uses the same envelope with `success` equal to
+`false` and a response explaining the result. Both values are completed server
+results and are displayed verbatim by the watch; `success: false` is not a
+bridge failure.
 
-Malformed JSON, binary frames, unknown message types, acknowledgements for
-another request, and otherwise unrelated frames do not count as success. They
-are ignored until a matching response arrives or the deadline expires.
+The result must be a WebSocket text frame containing valid JSON. It counts only
+while PebbleKit JS awaits a result and only when `version`, `type`, and
+`requestId` match the active request. `success` must be a JSON boolean.
+`response` must be a JSON string whose UTF-8 representation is no larger than
+1,024 bytes. Additional properties are ignored.
+
+Malformed or binary frames and frames for another request are unrelated and
+are ignored until a matching frame or timeout. A frame correlated to the
+active request but containing a wrong version, unknown type, invalid success,
+invalid response, or oversized response is an immediate protocol failure.
 
 ### 9.4 Server error
 
@@ -412,7 +498,7 @@ The server may reject a request with:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "type": "error",
   "requestId": "1a2b3c4d",
   "code": "invalid_request"
@@ -420,28 +506,29 @@ The server may reject a request with:
 ```
 
 A valid error with the matching version and request identifier fails the
-request immediately. `code` must be a nonempty string for logging but is not
-shown verbatim on the watch. Additional properties are ignored. A malformed or
-nonmatching error is treated as an unrelated frame and does not stop the
-acknowledgement timer.
+bridge immediately. `code` must be a nonempty string for logging but is not
+shown verbatim on the watch. Additional properties are ignored. A malformed
+correlated error is a protocol failure; a nonmatching error is unrelated.
 
 ### 9.5 PebbleKit JS completion
 
 Immediately after successfully invoking `WebSocket.send()` with the request,
 PebbleKit JS:
 
-1. starts the exact server acknowledgement timer;
+1. starts the exact server-result timer;
 2. sends `SEND_STARTED` to the watch; and
-3. waits for a matching acknowledgement, matching server error, socket error,
+3. waits for a matching result, matching server error, socket error,
    socket close, or timeout.
 
-Phone-to-watch status AppMessages must be serialized. If a remote response
-arrives before `SEND_STARTED` has reached the watch, PebbleKit JS queues
-`REMOTE_ACK` or `FAILURE` until the `SEND_STARTED` AppMessage succeeds.
+Phone-to-watch AppMessages must be serialized. If a remote result arrives
+synchronously during `WebSocket.send()` or before `SEND_STARTED` reaches the
+watch, PebbleKit JS holds it until `SEND_STARTED` is first in the AppMessage
+queue.
 
-After a matching acknowledgement, PebbleKit JS sends `REMOTE_ACK`. It closes
-the WebSocket and clears the transcript. On any terminal failure it sends 
-`FAILURE` when possible, closes the WebSocket, and clears all request and 
+After a matching result, PebbleKit JS closes the WebSocket and sends all
+`SERVER_RESULT_CHUNK` messages sequentially. It keeps the request coordinator
+alive until the final AppMessage completion callback. On a bridge failure it
+sends `FAILURE` when possible, closes the WebSocket, and clears all request and
 transcript state.
 
 ## 10. Deadlines
@@ -463,32 +550,51 @@ this timer's interval. If the watch's interval expires first, the watch shows
 a delivery failure, sends best-effort `SESSION_END`, and exits after the error
 display.
 
-### 10.2 Remote acknowledgement deadline
+### 10.2 Remote server-result deadline
 
-- Duration: 5,000 ms.
+- Duration: 20,000 ms.
 - Authoritative start point: immediately after `WebSocket.send()` successfully
   accepts the request without throwing.
-- Authoritative owner: PebbleKit JS.
-- Success condition: PebbleKit JS processes a matching `ack` frame before its
-  timer callback runs.
+- Authoritative owner: the PebbleKit JS WebSocket bridge.
+- Success condition: PebbleKit JS processes a matching `result` frame before
+  its timer callback runs.
 - Failure conditions: timer expiry, a matching server error, WebSocket error,
-  or WebSocket close before acknowledgement.
+  WebSocket close, or a malformed correlated frame before the result.
 
-After receiving `SEND_STARTED`, the watch starts a websocket request timeout
-guard to avoid hanging if PebbleKit JS becomes unresponsive. This guard is not
-the server acknowledgement deadline: the PebbleKit JS timer remains
-authoritative for whether the server responded within the deadline.
+After receiving `SEND_STARTED`, the watch phone/server bridge starts a 22,000
+ms liveness guard. This guard is deliberately longer and is not the server
+deadline: the PebbleKit JS timer remains authoritative and has time to deliver
+`FAILURE` after its 20-second timer fires.
 
-On PebbleKit JS timeout, it sends `FAILURE` with an acknowledgement-timeout
-status. On remote acknowledgement expiry without either `REMOTE_ACK` or `FAILURE`, the
-watch shows `WS request timed out`, sends best-effort `SESSION_END`, and exits after
-the error display.
+On PebbleKit JS timeout, it sends `FAILURE` with
+`STATUS_SERVER_RESULT_TIMEOUT`. If neither a result chunk nor `FAILURE` reaches
+the watch before its 22-second guard, the watch shows `WS request timed out`,
+sends best-effort `SESSION_END`, and exits after the error display.
 
-### 10.3 Error display
+### 10.3 Result-chunk inactivity deadline
 
 - Duration: 3,000 ms.
-- Start point: the error or cancellation state is visible on the watch.
-- End condition: watchapp cleanup and exit.
+- Owner: the watch/phone bridge.
+- Start point: the first valid non-final `SERVER_RESULT_CHUNK`.
+- Reset point: every subsequent valid non-final result chunk.
+- Success condition: the final valid result chunk completes reassembly.
+- Failure condition: timer expiry while the result is incomplete.
+
+The first result chunk cancels the 22-second phone/server guard. A stalled
+reverse transfer shows `Result timed out`, sends best-effort `SESSION_END`, and
+exits after the error display.
+
+### 10.4 Terminal display
+
+- Duration: 3,000 ms.
+- Start point: the complete result, error, or cancellation state is visible on
+  the watch.
+- Result interaction: any button press cancels the result timer. UP and DOWN
+  also perform normal ScrollLayer scrolling. After cancellation, BACK is the
+  only exit path.
+- Error/cancellation interaction: unchanged; their timer remains active.
+- End condition: timer expiry when still active, or manual BACK exit from an
+  interacted-with result screen.
 
 No deadline triggers a retry.
 
@@ -515,8 +621,8 @@ three-second lifetime.
 ### 11.2 PebbleKit JS or WebSocket failure
 
 Examples include connection failure, invalid chunk sequence, JSON serialization
-failure, `WebSocket.send()` throwing, matching server error, socket error,
-socket close, or acknowledgement timeout.
+failure, `WebSocket.send()` throwing, malformed correlated result, matching
+server error, socket error, socket close, or server-result timeout.
 
 PebbleKit JS:
 
@@ -539,18 +645,26 @@ Implementations must share stable numeric status constants. At minimum:
 | `5` | `STATUS_PROTOCOL` | Watch or JS |
 | `6` | `STATUS_TRANSFER` | Watch or JS |
 | `7` | `STATUS_SERVER_ERROR` | JS |
-| `8` | `STATUS_ACK_TIMEOUT` | JS or watch |
+| `8` | `STATUS_SERVER_RESULT_TIMEOUT` | JS |
+| `9` | `STATUS_TRANSCRIPT_DELIVERY_TIMEOUT` | Watch |
+| `10` | `STATUS_WS_REQUEST_TIMEOUT` | Watch |
+| `11` | `STATUS_RESULT_TRANSFER_TIMEOUT` | Watch |
 
-The watch uses these codes for mapping and diagnostics; it must not display
-server-controlled strings.
+The watch uses these codes for bridge error mapping and diagnostics. It shows a
+server-controlled string only after validating and completely reassembling a
+final application result. Bridge failures always use local status text.
 
 ## 12. Data handling and privacy
 
 - The watchapp holds the transcription only in volatile memory for the current
   request.
-- PebbleKit JS holds chunks and serialized JSON only until terminal cleanup.
-- Neither component logs transcript content in production.
-- Neither component writes the transcript to persistent storage.
+- The watchapp holds the server response only until its terminal display is
+  destroyed.
+- PebbleKit JS holds transcript/result chunks and serialized JSON only until
+  terminal cleanup.
+- Neither component logs transcript or response content in production.
+- Neither component writes transcript or response content to persistent
+  storage.
 - No partial transcript is sent to the WebSocket server.
 - Native Pebble dictation may use phone and cloud voice services; this
   specification's local WebSocket deployment does not make transcription
@@ -585,29 +699,43 @@ server-controlled strings.
 12. Only one transcript request and one WebSocket text frame are sent per app
     run.
 
-### 13.3 Acknowledgement and timing
+### 13.3 Result and timing
 
-13.  A matching acknowledgement received within five seconds of
-    `WebSocket.send()` causes `REMOTE_ACK` and immediate watchapp exit. If this timeout
-    expires, `WS server timed out` is produced for three seconds followed by exit. A race
-    condition may produce either result.
-14.  AppMessage outbox success and `WebSocket.send()` success alone do not close
-    the watchapp as a success.
-15.  A malformed, binary, wrong-version, wrong-type, or wrong-request
-    acknowledgement is ignored and cannot produce success.
-16.  A matching server error produces a three-second delivery error and exit.
-17.  Lack of `SEND_STARTED` within two seconds of final-chunk delivery produces a
-    three-second delivery error and exit.
-18.  No timeout or failure path retries dictation, AppMessage transfer,
-    WebSocket connection, or WebSocket send.
+13. A matching result received within 20 seconds of `WebSocket.send()` is
+  transferred to the watch and displayed for three seconds unless the user
+  presses a button.
+14. Both `success: true` and `success: false` are completed application results
+  with `Success` or `Failure` headings respectively.
+15. AppMessage outbox success and `WebSocket.send()` success alone do not close
+  or claim success.
+16. An immediate synchronous result is still queued behind `SEND_STARTED`.
+17. A malformed or binary frame and a wrong-request frame are ignored. A
+  wrong-version, wrong-type, malformed, or oversized correlated frame fails
+  the protocol and cannot produce a result screen.
+18. A matching server error produces a three-second local delivery error.
+19. Lack of `SEND_STARTED` within two seconds of final transcript-chunk delivery
+  produces a three-second delivery error.
+20. A 20-second server-result expiry reaches the watch before its 22-second
+  liveness guard under normal bridge operation.
+21. A result transfer that stalls for three seconds between valid chunks shows
+  a result-transfer timeout.
+22. Empty, multibyte, multi-chunk, and exactly 1,024-byte responses are
+  reconstructed exactly; a 1,025-byte response is rejected rather than
+  truncated.
+23. Pressing UP or DOWN on a result screen cancels automatic close and still
+  scrolls normally; pressing BACK then exits manually.
+24. No timeout or failure path retries dictation, AppMessage transfer,
+  WebSocket connection, or WebSocket send.
 
 ### 13.4 Cleanup
 
-19. Successful completion leaves no active watch timer or dictation session.
-20. Cancellation and every error path release transcript and chunk state.
-21. PebbleKit JS closes the request WebSocket and clears volatile request data
-    after acknowledgement, failure, or `SESSION_END`.
-22. Transcript content is not persisted or logged by watchapp or PebbleKit JS.
+25. Completed result display leaves no active watch timer or dictation session.
+26. Cancellation and every error path release transcript, response, and chunk
+  state.
+27. PebbleKit JS closes the request WebSocket and clears volatile request data
+  after final result delivery, failure, or `SESSION_END`.
+28. Transcript and response content are not persisted or logged by watchapp or
+  PebbleKit JS.
 
 ## 14. SDK references
 

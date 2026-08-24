@@ -7,12 +7,16 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosedError
 
 from dictation_websocket_server import (
+    BridgeError,
+    BridgeState,
     DictationMessage,
     DictationProtocolError,
-    acknowledgement_payload,
+    DictationWebSocketBridge,
+    ServerResult,
     dictation_messages,
     error_payload,
     parse_dictation_message,
+    result_payload,
     start_server,
 )
 
@@ -20,9 +24,21 @@ from dictation_websocket_server import (
 REQUEST_ID = "1a2b3c4d"
 
 
+class FakeConnection:
+    def __init__(self):
+        self.sent = []
+        self.closed = None
+
+    async def send(self, payload):
+        self.sent.append(payload)
+
+    async def close(self, code, reason):
+        self.closed = (code, reason)
+
+
 def request_payload(transcript="hello"):
     return {
-        "version": 1,
+        "version": 2,
         "type": "dictation",
         "requestId": REQUEST_ID,
         "transcript": transcript,
@@ -55,7 +71,7 @@ class DictationParserTest(unittest.TestCase):
 
     def test_rejects_wrong_version_with_request_id(self):
         payload = request_payload()
-        payload["version"] = 2
+        payload["version"] = 1
 
         with self.assertRaises(DictationProtocolError) as raised:
             parse_dictation_message(json.dumps(payload))
@@ -81,22 +97,34 @@ class DictationParserTest(unittest.TestCase):
 
     def test_builds_protocol_responses(self):
         self.assertEqual(
-            acknowledgement_payload(REQUEST_ID),
+            result_payload(
+                REQUEST_ID,
+                ServerResult(success=True, response="accepted"),
+            ),
             {
-                "version": 1,
-                "type": "ack",
+                "version": 2,
+                "type": "result",
                 "requestId": REQUEST_ID,
+                "success": True,
+                "response": "accepted",
             },
         )
         self.assertEqual(
             error_payload(REQUEST_ID, "rejected"),
             {
-                "version": 1,
+                "version": 2,
                 "type": "error",
                 "requestId": REQUEST_ID,
                 "code": "rejected",
             },
         )
+
+    def test_rejects_oversized_server_response(self):
+        with self.assertRaisesRegex(ValueError, "exceeds 1024"):
+            result_payload(
+                REQUEST_ID,
+                ServerResult(success=True, response="x" * 1025),
+            )
 
 
 class DictationServerTest(unittest.IsolatedAsyncioTestCase):
@@ -105,6 +133,7 @@ class DictationServerTest(unittest.IsolatedAsyncioTestCase):
 
         async def handler(message):
             self.messages.append(message)
+            return ServerResult(True, "accepted")
 
         self.server = await start_server(
             handler,
@@ -118,7 +147,7 @@ class DictationServerTest(unittest.IsolatedAsyncioTestCase):
         self.server.close()
         await self.server.wait_closed()
 
-    async def test_acknowledges_after_handler_accepts_message(self):
+    async def test_returns_result_after_handler_accepts_message(self):
         async with connect(self.uri) as websocket:
             await websocket.send(json.dumps(request_payload("accepted")))
             response = json.loads(await websocket.recv())
@@ -126,9 +155,11 @@ class DictationServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             response,
             {
-                "version": 1,
-                "type": "ack",
+                "version": 2,
+                "type": "result",
                 "requestId": REQUEST_ID,
+                "success": True,
+                "response": "accepted",
             },
         )
         self.assertEqual(
@@ -136,7 +167,7 @@ class DictationServerTest(unittest.IsolatedAsyncioTestCase):
             [DictationMessage(REQUEST_ID, "accepted")],
         )
 
-    async def test_acknowledges_before_handler_completes(self):
+    async def test_waits_for_handler_before_returning_result(self):
         handler_started = asyncio.Event()
         allow_handler_to_finish = asyncio.Event()
 
@@ -144,6 +175,7 @@ class DictationServerTest(unittest.IsolatedAsyncioTestCase):
             self.messages.append(message)
             handler_started.set()
             await allow_handler_to_finish.wait()
+            return ServerResult(True, "finished")
 
         self.server.close()
         await self.server.wait_closed()
@@ -153,11 +185,16 @@ class DictationServerTest(unittest.IsolatedAsyncioTestCase):
 
         async with connect(self.uri) as websocket:
             await websocket.send(json.dumps(request_payload("accepted")))
-            response = json.loads(await websocket.recv())
             await handler_started.wait()
+            response_task = asyncio.create_task(websocket.recv())
+            self.assertFalse(response_task.done())
+            allow_handler_to_finish.set()
+            response = json.loads(await response_task)
 
-        self.assertEqual(response, acknowledgement_payload(REQUEST_ID))
-        allow_handler_to_finish.set()
+        self.assertEqual(
+            response,
+            result_payload(REQUEST_ID, ServerResult(True, "finished")),
+        )
 
     async def test_sends_correlated_protocol_error(self):
         payload = request_payload()
@@ -181,8 +218,68 @@ class DictationServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.rcvd.code, 1008)
 
 
+class DictationBridgeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_records_completed_handler_session(self):
+        connection = FakeConnection()
+        delivered = []
+
+        def handler(message):
+            delivered.append(message)
+            return ServerResult(True, "bridged")
+
+        bridge = DictationWebSocketBridge(connection, handler)
+
+        self.assertTrue(
+            await bridge.handle_frame(json.dumps(request_payload("bridged")))
+        )
+
+        self.assertEqual(
+            delivered,
+            [DictationMessage(REQUEST_ID, "bridged")],
+        )
+        self.assertEqual(bridge.last_session.state, BridgeState.COMPLETE)
+        self.assertEqual(bridge.last_session.error, BridgeError.NONE)
+        self.assertEqual(
+            json.loads(connection.sent[0]),
+            result_payload(REQUEST_ID, ServerResult(True, "bridged")),
+        )
+
+    async def test_records_nonfatal_handler_failure(self):
+        connection = FakeConnection()
+
+        def fail_handler(message):
+            del message
+            raise RuntimeError("failed")
+
+        bridge = DictationWebSocketBridge(connection, fail_handler)
+
+        self.assertTrue(
+            await bridge.handle_frame(json.dumps(request_payload("bridged")))
+        )
+        self.assertEqual(bridge.last_session.state, BridgeState.FAILED)
+        self.assertEqual(bridge.last_session.error, BridgeError.HANDLER)
+        self.assertEqual(json.loads(connection.sent[0])["code"], "handler_error")
+
+    async def test_reports_invalid_handler_result(self):
+        connection = FakeConnection()
+        bridge = DictationWebSocketBridge(connection, lambda message: None)
+
+        self.assertTrue(
+            await bridge.handle_frame(json.dumps(request_payload("bridged")))
+        )
+        self.assertEqual(bridge.last_session.state, BridgeState.FAILED)
+        self.assertEqual(
+            bridge.last_session.error,
+            BridgeError.HANDLER_RESULT,
+        )
+        self.assertEqual(
+            json.loads(connection.sent[0])["code"],
+            "invalid_handler_result",
+        )
+
+
 class DictationMessageGeneratorTest(unittest.IsolatedAsyncioTestCase):
-    async def test_yields_message_after_acknowledgement(self):
+    async def test_yields_exchange_and_returns_its_response(self):
         with socket.socket() as socket_probe:
             socket_probe.bind(("127.0.0.1", 0))
             port = socket_probe.getsockname()[1]
@@ -194,12 +291,16 @@ class DictationMessageGeneratorTest(unittest.IsolatedAsyncioTestCase):
         try:
             async with connect("ws://127.0.0.1:{}".format(port)) as websocket:
                 await websocket.send(json.dumps(request_payload("streamed")))
+                exchange = await next_message
+                exchange.respond(ServerResult(False, "rejected"))
                 response = json.loads(await websocket.recv())
-                message = await next_message
 
-            self.assertEqual(response, acknowledgement_payload(REQUEST_ID))
             self.assertEqual(
-                message,
+                response,
+                result_payload(REQUEST_ID, ServerResult(False, "rejected")),
+            )
+            self.assertEqual(
+                exchange.message,
                 DictationMessage(REQUEST_ID, "streamed"),
             )
         finally:
