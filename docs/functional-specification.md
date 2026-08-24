@@ -17,7 +17,7 @@ The intended interaction is:
    endpoint.
 6. The remote server returns a correlated application result.
 7. PebbleKit JS transfers the result to the watchapp.
-8. The watchapp displays the result for three seconds and closes unless the
+8. The watchapp displays the result for five seconds and closes unless the
   user interacts with it.
 
 The first version prioritizes a short interaction, deterministic behavior, and
@@ -161,7 +161,7 @@ responsibility.
 4. While the server processes the request, the watchapp continues to show
   `Sending...` for up to the server-result deadline.
 5. The watch displays a `Success` or `Failure` heading and the server's response
-  for three seconds, then closes.
+  for five seconds, then closes.
 
 When a complete result becomes visible, `success: true` produces one short
 vibration and `success: false` produces three short vibrations. Bridge and
@@ -173,7 +173,7 @@ setting.
 
 The result body is vertically scrollable with the UP and DOWN buttons when it
 does not fit on the Emery display. Any result-screen button press cancels the
-three-second close timer. UP and DOWN retain their normal scrolling behavior
+five-second close timer. UP and DOWN retain their normal scrolling behavior
 while cancelling the timer; after cancellation, the user exits manually with
 BACK. An empty response is valid and displays an empty body.
 
@@ -182,7 +182,7 @@ call to `WebSocket.send()`.
 
 ### 6.2 Failure and cancellation flow
 
-The app displays a concise status for three seconds and then closes.
+The app displays a concise status for five seconds and then closes.
 When the status becomes visible, the watchapp triggers the backlight using the
 same standard system behavior as the result screen.
 
@@ -199,7 +199,7 @@ The implementation must distinguish at least these user-facing categories:
 | Result transfer timeout | `Result timed out` | Phone-to-watch result chunks stall |
 
 Exact typography and layout are implementation details, but each message must
-fit on `emery` without scrolling. The three-second duration begins when the
+fit on `emery` without scrolling. The five-second duration begins when the
 watchapp's error state becomes visible.
 
 ## 7. Watchapp behavior
@@ -239,7 +239,7 @@ The dictation session must:
 Disabling confirmation allows native speech/silence detection to complete the
 interaction without another button press. Disabling native error dialogs
 prevents automatic retries and lets the watchapp provide one consistent
-three-second error state.
+five-second error state.
 
 The callback-provided transcription must be copied into watch-owned memory
 before the callback returns because the SDK frees the callback string
@@ -263,7 +263,7 @@ A success status with an empty transcription is treated as no speech and must
 not be sent.
 
 Any non-success result sends a best-effort `SESSION_END`, displays its
-three-second status, and closes. There is no automatic second dictation attempt.
+five-second status, and closes. There is no automatic second dictation attempt.
 
 ### 7.4 State machine
 
@@ -275,7 +275,7 @@ The watchapp has the following top-level application states:
 | `DICTATING` | Native dictation owns the foreground interaction | `BRIDGING`, `ERROR` |
 | `BRIDGING` | One or both logical bridges are transferring or waiting | `DISPLAYING_RESULT`, `ERROR` |
 | `DISPLAYING_RESULT` | A complete success or failure result is visible; interaction cancels automatic close | closed |
-| `ERROR` | A status is visible for three seconds | closed |
+| `ERROR` | A status is visible for five seconds | closed |
 
 The watch/phone bridge owns these states:
 
@@ -308,13 +308,13 @@ sequence is a protocol failure.
 ### 7.5 Exit and cleanup
 
 On a complete application result, the watchapp cancels bridge timers and
-retains the response while its layers use it. It closes after three seconds if
+retains the response while its layers use it. It closes after five seconds if
 there is no interaction. Any button press cancels automatic close; UP and DOWN
 continue to scroll, and BACK manually closes the app. Exit releases response,
 transcript, layer, timer, and dictation resources.
 
 On `ERROR`, cleanup may begin immediately, but the root window remains visible
-for the three-second error duration before the app exits.
+for the five-second error duration before the app exits.
 
 Closing the app must not leave an active dictation session or watch timer.
 `dictation_session_stop()` is used only when cancelling an in-progress session;
@@ -597,7 +597,7 @@ exits after the error display.
 
 ### 10.4 Terminal display
 
-- Duration: 3,000 ms.
+- Duration: 5,000 ms.
 - Start point: the complete result, error, or cancellation state is visible on
   the watch.
 - Result interaction: any button press cancels the result timer. UP and DOWN
@@ -623,11 +623,11 @@ The watchapp:
 2. stops dictation if it is still in progress;
 3. sends best-effort `SESSION_END` if AppMessage is usable;
 4. releases transcript state;
-5. displays the mapped status for three seconds; and
+5. displays the mapped status for five seconds; and
 6. closes.
 
 The best-effort cleanup message must not delay the error display or extend the
-three-second lifetime.
+five-second lifetime.
 
 ### 11.2 PebbleKit JS or WebSocket failure
 
@@ -692,7 +692,7 @@ final application result. Bridge failures always use local status text.
 4. Dictation confirmation and native retry/error dialogs are disabled.
 5. Natural speech completion proceeds to `Sending...`.
 6. User cancellation, no speech, disabled dictation, and connectivity failure
-   each show an appropriate status for three seconds and close without sending a
+  each show an appropriate status for five seconds and close without sending a
    WebSocket request.
 
 ### 13.2 Transfer correctness
@@ -713,7 +713,7 @@ final application result. Bridge failures always use local status text.
 ### 13.3 Result and timing
 
 13. A matching result received within 60 seconds of `WebSocket.send()` is
-  transferred to the watch and displayed for three seconds unless the user
+  transferred to the watch and displayed for five seconds unless the user
   presses a button.
 14. Both `success: true` and `success: false` are completed application results
   with `Success` or `Failure` headings and one or three short vibrations,
@@ -724,9 +724,9 @@ final application result. Bridge failures always use local status text.
 17. A malformed or binary frame and a wrong-request frame are ignored. A
   wrong-version, wrong-type, malformed, or oversized correlated frame fails
   the protocol and cannot produce a result screen.
-18. A matching server error produces a three-second local delivery error.
+18. A matching server error produces a five-second local delivery error.
 19. Lack of `SEND_STARTED` within two seconds of final transcript-chunk delivery
-  produces a three-second delivery error.
+  produces a five-second delivery error.
 20. A 60-second server-result expiry reaches the watch before its 62-second
   liveness guard under normal bridge operation.
 21. A result transfer that stalls for three seconds between valid chunks shows
