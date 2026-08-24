@@ -8,7 +8,8 @@ function BridgeTimer(durationMs, timerApi) {
 
 BridgeTimer.prototype.start = function(callback) {
   this.cancel();
-  this.handle = this.timerApi.setTimeout(function() {
+  var setTimer = this.timerApi.setTimeout;
+  this.handle = setTimer(function() {
     this.handle = null;
     callback();
   }.bind(this), this.durationMs);
@@ -16,7 +17,8 @@ BridgeTimer.prototype.start = function(callback) {
 
 BridgeTimer.prototype.cancel = function() {
   if (this.handle !== null) {
-    this.timerApi.clearTimeout(this.handle);
+    var clearTimer = this.timerApi.clearTimeout;
+    clearTimer(this.handle);
     this.handle = null;
   }
 };

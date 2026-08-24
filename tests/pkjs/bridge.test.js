@@ -1,6 +1,7 @@
 'use strict';
 
 var assert = require('assert');
+var BridgeTimer = require('../../src/pkjs/bridge_timer');
 var protocol = require('../../src/pkjs/protocol');
 var sessionModule = require('../../src/pkjs/bridge_session');
 var watchModule = require('../../src/pkjs/watch_bridge');
@@ -116,7 +117,10 @@ function createHarness() {
   var session = new sessionModule.BridgeSession(REQUEST_ID, {
     websocketUrl: 'ws://example.test/',
     WebSocket: FakeWebSocket,
-    timerApi: timers,
+    timerApi: {
+      setTimeout: timers.setTimeout.bind(timers),
+      clearTimeout: timers.clearTimeout.bind(timers)
+    },
     handoffTimeoutMs: 2000,
     resultTimeoutMs: 20000,
     appMessageTransport: transport,
@@ -135,6 +139,25 @@ function createHarness() {
 
 function messageType(payload) {
   return payload[protocol.KEYS.MESSAGE_TYPE];
+}
+
+function testTimerApiUsesPlainFunctionCalls() {
+  var callback = function() {};
+  var timer = new BridgeTimer(2000, {
+    setTimeout: function(receivedCallback, durationMs) {
+      assert.strictEqual(this, undefined);
+      assert.strictEqual(receivedCallback instanceof Function, true);
+      assert.strictEqual(durationMs, 2000);
+      return 42;
+    },
+    clearTimeout: function(handle) {
+      assert.strictEqual(this, undefined);
+      assert.strictEqual(handle, 42);
+    }
+  });
+
+  timer.start(callback);
+  timer.cancel();
 }
 
 function testResultWaitsBehindSendStarted() {
@@ -237,6 +260,7 @@ function testMultiChunkResultIsDeliveredSequentially() {
   assert.strictEqual(harness.isClosed(), true);
 }
 
+testTimerApiUsesPlainFunctionCalls();
 testResultWaitsBehindSendStarted();
 testSynchronousReplyIsOrdered();
 testHandoffTimeout();

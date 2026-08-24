@@ -393,7 +393,8 @@ async def start_server(
 
     callback = handler or _accept_message
 
-    async def connection_handler(connection: ServerConnection) -> None:
+    async def connection_handler(connection: ServerConnection) -> None:             
+        print(f"New connection from {connection.remote_address}")
         await _handle_connection(connection, callback)
 
     return await serve(
@@ -419,6 +420,7 @@ async def dictation_messages(
     pending: Set[DictationExchange] = set()
 
     async def enqueue(message: DictationMessage) -> ServerResult:
+        print(f"Enqueueing message: {message.request_id} - {message.transcript}")
         exchange = DictationExchange(message)
         pending.add(exchange)
         exchanges.put_nowait(exchange)
