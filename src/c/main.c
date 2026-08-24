@@ -548,7 +548,7 @@ static void prv_vibrate_for_server_result(bool success) {
     return;
   }
 
-  static const uint32_t segments[] = {200, 100, 200, 100, 200};
+  static const uint32_t segments[] = {100, 100, 100, 100, 100};
   vibes_enqueue_custom_pattern((VibePattern){
       .durations = segments,
       .num_segments = ARRAY_LENGTH(segments),

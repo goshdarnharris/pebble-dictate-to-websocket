@@ -22,6 +22,7 @@
           packages = with pkgs; [
             llvmPackages_21.clangNoLibc.cc
             bear
+            ripgrep
           ];
         };
       }
