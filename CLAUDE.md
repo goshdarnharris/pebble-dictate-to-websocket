@@ -92,6 +92,9 @@ Key Entry Points:
 - https://developer.repebble.com/guides/events-and-services/buttons - Button handling
 - https://developer.repebble.com/guides/user-interfaces/layers - UI foundations
 
+## Functional Specification
+A functional specification for the complete application is available at docs/functional-specification.md. This document should be considered the source of truth & intent for the complete application: look at it first whenever planning or implementing changes to code.
+
 ## Development Best Practices
 
 - Whenever making changes, run `pebble screenshot --scale 6` and view the screenshot to make sure it's what the user requested. If not, make more changes until it does what it's supposed to.

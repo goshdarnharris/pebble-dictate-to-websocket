@@ -25,13 +25,15 @@ var MESSAGE_TYPES = {
 var STATUS_CODES = {
   NORMAL: 0,
   CANCELLED: 1,
-  DICTATION: 2,
-  NO_SPEECH: 3,
-  CONNECTIVITY: 4,
-  PROTOCOL: 5,
-  TRANSFER: 6,
-  SERVER_ERROR: 7,
-  ACK_TIMEOUT: 8
+  ERROR_DICTATION: 2,
+  ERROR_NO_SPEECH: 3,
+  ERROR_PHONE_CONNECTIVITY: 4,
+  ERROR_PROTOCOL: 5,
+  ERROR_TRANSFER: 6,
+  ERROR_SERVER: 7,
+  ERROR_ACK_TIMEOUT: 8,
+  ERROR_TRANSCRIPT_DELIVERY_TIMEOUT: 9,
+  ERROR_WS_REQUEST_TIMEOUT: 10,
 };
 
 function protocolError(message) {
@@ -131,7 +133,7 @@ function parseWatchMessage(payload) {
     utf8ByteLength(message.chunkText);
   } else if (type === MESSAGE_TYPES.SESSION_END) {
     message.statusCode = requireUint32(payload, KEYS.STATUS_CODE);
-    if (message.statusCode > STATUS_CODES.ACK_TIMEOUT) {
+    if (message.statusCode > STATUS_CODES.ERROR_WS_REQUEST_TIMEOUT) {
       throw protocolError('Invalid status code');
     }
   } else if (type !== MESSAGE_TYPES.SESSION_BEGIN) {

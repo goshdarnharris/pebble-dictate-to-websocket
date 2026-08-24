@@ -4,8 +4,8 @@ var protocol = require('./protocol');
 
 // Change this build-time value to the WebSocket server reachable by the phone.
 var WEBSOCKET_URL = 'ws://192.168.50.199:8080/';
-var WS_REQUEST_TIMEOUT_MS = 3000;
-var ACK_TIMEOUT_MS = 2000;
+var WS_REQUEST_TIMEOUT_MS = 2000;
+var ACK_TIMEOUT_MS = 5000;
 
 var activeSession = null;
 var statusQueue = [];
@@ -175,7 +175,7 @@ function handleServerMessage(session, data) {
   if (result.kind === 'ack') {
     terminateWithAck(session);
   } else if (result.kind === 'error') {
-    terminateWithFailure(session, protocol.STATUS_CODES.SERVER_ERROR);
+    terminateWithFailure(session, protocol.STATUS_CODES.ERROR_SERVER);
   }
 }
 
@@ -196,7 +196,7 @@ function trySendTranscript(session) {
     serialized = JSON.stringify(request);
     session.socket.send(serialized);
   } catch (error) {
-    terminateWithFailure(session, protocol.STATUS_CODES.TRANSFER);
+    terminateWithFailure(session, protocol.STATUS_CODES.ERROR_TRANSFER);
     return;
   }
 
@@ -204,7 +204,7 @@ function trySendTranscript(session) {
   clearTimer(session.handoffTimer);
   session.handoffTimer = null;
   session.ackTimer = setTimeout(function() {
-    terminateWithFailure(session, protocol.STATUS_CODES.ACK_TIMEOUT);
+    terminateWithFailure(session, protocol.STATUS_CODES.ERROR_ACK_TIMEOUT);
   }, ACK_TIMEOUT_MS);
 
   enqueueStatus(
@@ -222,7 +222,7 @@ function openSocket(session) {
   try {
     session.socket = new WebSocket(WEBSOCKET_URL);
   } catch (error) {
-    terminateWithFailure(session, protocol.STATUS_CODES.TRANSFER);
+    terminateWithFailure(session, protocol.STATUS_CODES.ERROR_SERVER);
     return;
   }
 
@@ -231,11 +231,11 @@ function openSocket(session) {
   };
 
   session.socket.onerror = function() {
-    terminateWithFailure(session, protocol.STATUS_CODES.TRANSFER);
+    terminateWithFailure(session, protocol.STATUS_CODES.ERROR_SERVER);
   };
 
   session.socket.onclose = function() {
-    terminateWithFailure(session, protocol.STATUS_CODES.TRANSFER);
+    terminateWithFailure(session, protocol.STATUS_CODES.ERROR_SERVER);
   };
 
   session.socket.onmessage = function(event) {
@@ -272,7 +272,7 @@ function handleChunk(session, message) {
   try {
     result = session.assembler.add(message);
   } catch (error) {
-    terminateWithFailure(session, protocol.STATUS_CODES.PROTOCOL);
+    terminateWithFailure(session, protocol.STATUS_CODES.ERROR_PROTOCOL);
     return;
   }
 
@@ -282,7 +282,7 @@ function handleChunk(session, message) {
 
   session.transcript = result.transcript;
   session.handoffTimer = setTimeout(function() {
-    terminateWithFailure(session, protocol.STATUS_CODES.TRANSFER);
+    terminateWithFailure(session, protocol.STATUS_CODES.ERROR_TRANSFER);
   }, WS_REQUEST_TIMEOUT_MS);
   trySendTranscript(session);
 }
@@ -300,7 +300,7 @@ Pebble.addEventListener('appmessage', function(event) {
         event.payload[protocol.KEYS.REQUEST_ID];
     if (activeSession &&
         (!rawRequestId || rawRequestId === activeSession.requestId)) {
-      terminateWithFailure(activeSession, protocol.STATUS_CODES.PROTOCOL);
+      terminateWithFailure(activeSession, protocol.STATUS_CODES.ERROR_PROTOCOL);
     }
     return;
   }

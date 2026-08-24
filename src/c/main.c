@@ -103,13 +103,13 @@ static const char *prv_status_text(AppStatusCode status) {
     case STATUS_CANCELLED:
       return "Dictation\ncancelled";
     case STATUS_ERROR_DICTATION:
-      return "Dictation\nunavailable";
+      return "Dictation\nerror";
     case STATUS_ERROR_NO_SPEECH:
       return "No speech\nheard";
     case STATUS_ERROR_PHONE_CONNECTIVITY:
       return "Phone\nunavailable";
     case STATUS_ERROR_ACK_TIMEOUT:
-      return "Connection\ntimed out";
+      return "WS server\ntimed out";
     case STATUS_ERROR_PROTOCOL:
     case STATUS_ERROR_TRANSFER:
     case STATUS_ERROR_SERVER:
@@ -117,7 +117,7 @@ static const char *prv_status_text(AppStatusCode status) {
     case STATUS_ERROR_TRANSCRIPT_DELIVERY_TIMEOUT:
       return "Delivery\ntimed out";
     case STATUS_ERROR_WS_REQUEST_TIMEOUT:
-      return "WS server\ntimed out";
+      return "WS request\ntimed out";
     case STATUS_NORMAL:
     default:
       return "Unknown\nerror";
@@ -142,7 +142,6 @@ static void prv_generate_request_id(void) {
 
   uint32_t value = (uint32_t)seconds;
   value ^= (uint32_t)milliseconds << 16;
-  value ^= (uint32_t)(uintptr_t)&s_app;
   if (value == 0) {
     value = 1;
   }
@@ -200,7 +199,7 @@ static void prv_try_send_session_end(void) {
   s_app.session_end_pending = false;
 
   DictionaryIterator *iterator;
-  if (!prv_begin_outbox(&iterator, MESSAGE_TYPE_SESSION_END) ||
+  if (prv_begin_outbox(&iterator, MESSAGE_TYPE_SESSION_END) != APP_MSG_OK ||
       dict_write_uint32(iterator, MESSAGE_KEY_STATUS_CODE,
                         s_app.terminal_status) != DICT_OK ||
       app_message_outbox_send() != APP_MSG_OK) {
@@ -308,10 +307,11 @@ static bool prv_prepare_chunks(void) {
   return count > 0;
 }
 
-static bool prv_send_chunk(size_t length) {
+static AppMessageResult prv_send_chunk(size_t length) {
   DictionaryIterator *iterator;
-  if (!prv_begin_outbox(&iterator, MESSAGE_TYPE_TRANSCRIPT_CHUNK)) {
-    return false;
+  AppMessageResult result = prv_begin_outbox(&iterator, MESSAGE_TYPE_TRANSCRIPT_CHUNK);
+  if (result != APP_MSG_OK) {
+    return result;
   }
 
   char *chunk_end = s_app.transcript + s_app.next_chunk_offset + length;
@@ -330,13 +330,18 @@ static bool prv_send_chunk(size_t length) {
 
   *chunk_end = saved;
 
-  if (!wrote_message || app_message_outbox_send() != APP_MSG_OK) {
-    return false;
+  if (!wrote_message) {
+    return APP_MSG_INTERNAL_ERROR;
+  }
+  
+  result = app_message_outbox_send();
+  if (result != APP_MSG_OK) {
+    return result;
   }
 
   s_app.outbox_chunk_bytes = length;
   s_app.outbox_message = OUTBOX_TRANSCRIPT_CHUNK;
-  return true;
+  return APP_MSG_OK;
 }
 
 static void prv_transcript_delivery_timeout(void *context) {
@@ -364,7 +369,14 @@ static void prv_send_next_chunk(void) {
   }
 
   const size_t length = prv_next_chunk_length(s_app.next_chunk_offset);
-  if (length == 0 || !prv_send_chunk(length)) {
+  if(length == 0) {
+    prv_fail(STATUS_ERROR_TRANSFER);
+    return;
+  }
+  AppMessageResult result = prv_send_chunk(length);
+  if(result & APP_MSG_NOT_CONNECTED) {
+    prv_fail(STATUS_ERROR_PHONE_CONNECTIVITY);
+  } else if(result != APP_MSG_OK) {
     prv_fail(STATUS_ERROR_TRANSFER);
   }
 }
@@ -747,8 +759,10 @@ static bool prv_init(void) {
   AppMessageResult result = app_message_open(inbox_size, s_app.outbox_size);
   if(result & APP_MSG_NOT_CONNECTED) {
     prv_fail(STATUS_ERROR_PHONE_CONNECTIVITY);
+    return true;
   } else if(result != APP_MSG_OK) {
     prv_fail(STATUS_ERROR_TRANSFER);
+    return true;
   }
   s_app.app_message_ready = true;
 
@@ -764,8 +778,10 @@ static bool prv_init(void) {
   result = prv_send_session_begin();
   if(result & APP_MSG_NOT_CONNECTED) {
     prv_fail(STATUS_ERROR_PHONE_CONNECTIVITY);
+    return true;
   } else if(result != APP_MSG_OK) {
     prv_fail(STATUS_ERROR_TRANSFER);
+    return true;
   }
 
   if (dictation_session_start(s_app.dictation) !=

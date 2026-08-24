@@ -13,7 +13,7 @@
   "pebble": {
     "displayName": "Dictate WS",
     "uuid": "45be3424-4406-444e-8878-adc999bc479e",
-    "sdkVersion": "3",
+    "sdkVersion": "4",
     "enableMultiJS": true,
     "targetPlatforms": [
       "emery"

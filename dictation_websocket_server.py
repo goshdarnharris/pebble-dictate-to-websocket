@@ -57,15 +57,6 @@ class DictationProtocolError(ValueError):
         self.request_id = request_id
 
 
-class DictationRejected(Exception):
-    """Reject a valid dictation from an application callback."""
-
-    def __init__(self, code: str = "rejected") -> None:
-        if not _is_error_code(code):
-            raise ValueError("error code must be nonempty printable ASCII")
-        super().__init__(code)
-        self.code = code
-
 
 HandlerResult = Optional[Awaitable[None]]
 MessageHandler = Callable[[DictationMessage], HandlerResult]

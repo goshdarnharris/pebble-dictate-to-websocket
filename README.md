@@ -12,7 +12,7 @@ Set `WEBSOCKET_URL` near the top of `src/pkjs/index.js` to a `ws://` or `wss://`
 endpoint reachable by the phone. The checked-in value is an example local
 network address and must be changed for the deployment network.
 
-The server must reply within one second with a matching acknowledgement:
+The server must reply within five seconds with a matching acknowledgement:
 
 ```json
 {

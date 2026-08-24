@@ -9,7 +9,6 @@ from websockets.exceptions import ConnectionClosedError
 from dictation_websocket_server import (
     DictationMessage,
     DictationProtocolError,
-    DictationRejected,
     acknowledgement_payload,
     dictation_messages,
     error_payload,
@@ -105,8 +104,6 @@ class DictationServerTest(unittest.IsolatedAsyncioTestCase):
         self.messages = []
 
         async def handler(message):
-            if message.transcript == "reject":
-                raise DictationRejected("not_allowed")
             self.messages.append(message)
 
         self.server = await start_server(
@@ -173,14 +170,6 @@ class DictationServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["type"], "error")
         self.assertEqual(response["requestId"], REQUEST_ID)
         self.assertEqual(response["code"], "invalid_type")
-        self.assertEqual(self.messages, [])
-
-    async def test_acknowledges_application_rejection(self):
-        async with connect(self.uri) as websocket:
-            await websocket.send(json.dumps(request_payload("reject")))
-            response = json.loads(await websocket.recv())
-
-        self.assertEqual(response, acknowledgement_payload(REQUEST_ID))
         self.assertEqual(self.messages, [])
 
     async def test_closes_uncorrelated_invalid_request(self):
