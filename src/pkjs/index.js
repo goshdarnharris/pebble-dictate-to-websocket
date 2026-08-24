@@ -4,8 +4,8 @@ var protocol = require('./protocol');
 
 // Change this build-time value to the WebSocket server reachable by the phone.
 var WEBSOCKET_URL = 'ws://192.168.50.199:8080/';
-var HANDOFF_TIMEOUT_MS = 1000;
-var ACK_TIMEOUT_MS = 1000;
+var WS_REQUEST_TIMEOUT_MS = 3000;
+var ACK_TIMEOUT_MS = 2000;
 
 var activeSession = null;
 var statusQueue = [];
@@ -283,7 +283,7 @@ function handleChunk(session, message) {
   session.transcript = result.transcript;
   session.handoffTimer = setTimeout(function() {
     terminateWithFailure(session, protocol.STATUS_CODES.TRANSFER);
-  }, HANDOFF_TIMEOUT_MS);
+  }, WS_REQUEST_TIMEOUT_MS);
   trySendTranscript(session);
 }
 

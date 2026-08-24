@@ -8,9 +8,9 @@
 #include <time.h>
 
 #define PROTOCOL_VERSION_VALUE 1
-#define HANDOFF_TIMEOUT_MS 1000
-#define BRIDGE_LIVENESS_TIMEOUT_MS 2000
-#define ERROR_DISPLAY_MS 2000
+#define TRANSCRIPT_DELIVERY_TIMEOUT_MS 2000
+#define WS_REQUEST_TIMEOUT_MS 5000
+#define ERROR_DISPLAY_MS 3000
 #define REQUEST_ID_LENGTH 8
 
 typedef enum {
@@ -25,13 +25,15 @@ typedef enum {
 typedef enum {
   STATUS_NORMAL = 0,
   STATUS_CANCELLED = 1,
-  STATUS_DICTATION = 2,
-  STATUS_NO_SPEECH = 3,
-  STATUS_CONNECTIVITY = 4,
-  STATUS_PROTOCOL = 5,
-  STATUS_TRANSFER = 6,
-  STATUS_SERVER_ERROR = 7,
-  STATUS_ACK_TIMEOUT = 8,
+  STATUS_ERROR_DICTATION = 2,
+  STATUS_ERROR_NO_SPEECH = 3,
+  STATUS_ERROR_PHONE_CONNECTIVITY = 4,
+  STATUS_ERROR_PROTOCOL = 5,
+  STATUS_ERROR_TRANSFER = 6,
+  STATUS_ERROR_SERVER = 7,
+  STATUS_ERROR_ACK_TIMEOUT = 8,
+  STATUS_ERROR_TRANSCRIPT_DELIVERY_TIMEOUT = 9,
+  STATUS_ERROR_WS_REQUEST_TIMEOUT = 10,
 } AppStatusCode;
 
 typedef enum {
@@ -55,8 +57,8 @@ typedef struct {
   Window *window;
   TextLayer *status_layer;
   DictationSession *dictation;
-  AppTimer *handoff_timer;
-  AppTimer *bridge_timer;
+  AppTimer *transcript_delivery_timer;
+  AppTimer *ws_request_timer;
   AppTimer *exit_timer;
   char *transcript;
   size_t transcript_bytes;
@@ -100,20 +102,25 @@ static const char *prv_status_text(AppStatusCode status) {
   switch (status) {
     case STATUS_CANCELLED:
       return "Dictation\ncancelled";
-    case STATUS_DICTATION:
+    case STATUS_ERROR_DICTATION:
       return "Dictation\nunavailable";
-    case STATUS_NO_SPEECH:
+    case STATUS_ERROR_NO_SPEECH:
       return "No speech\nheard";
-    case STATUS_CONNECTIVITY:
+    case STATUS_ERROR_PHONE_CONNECTIVITY:
       return "Phone\nunavailable";
-    case STATUS_ACK_TIMEOUT:
-      return "Server\ntimed out";
-    case STATUS_PROTOCOL:
-    case STATUS_TRANSFER:
-    case STATUS_SERVER_ERROR:
+    case STATUS_ERROR_ACK_TIMEOUT:
+      return "Connection\ntimed out";
+    case STATUS_ERROR_PROTOCOL:
+    case STATUS_ERROR_TRANSFER:
+    case STATUS_ERROR_SERVER:
+      return "Delivery\nfailed";
+    case STATUS_ERROR_TRANSCRIPT_DELIVERY_TIMEOUT:
+      return "Delivery\ntimed out";
+    case STATUS_ERROR_WS_REQUEST_TIMEOUT:
+      return "WS server\ntimed out";
     case STATUS_NORMAL:
     default:
-      return "Delivery\nfailed";
+      return "Unknown\nerror";
   }
 }
 
@@ -151,30 +158,37 @@ static bool prv_write_common(DictionaryIterator *iterator, MessageType type) {
                             s_app.request_id) == DICT_OK;
 }
 
-static bool prv_begin_outbox(DictionaryIterator **iterator, MessageType type) {
+static AppMessageResult prv_begin_outbox(DictionaryIterator **iterator, MessageType type) {
   if (!s_app.app_message_ready || s_app.outbox_message != OUTBOX_NONE) {
-    return false;
+    return APP_MSG_BUSY;
   }
 
-  if (app_message_outbox_begin(iterator) != APP_MSG_OK) {
-    return false;
+  AppMessageResult result = app_message_outbox_begin(iterator);
+  if (result != APP_MSG_OK) {
+    return result;
   }
 
-  return prv_write_common(*iterator, type);
+  if(prv_write_common(*iterator, type)) {
+    return APP_MSG_OK;
+  } else {
+    return APP_MSG_INTERNAL_ERROR;
+  }
 }
 
-static bool prv_send_session_begin(void) {
+static AppMessageResult prv_send_session_begin(void) {
   DictionaryIterator *iterator;
-  if (!prv_begin_outbox(&iterator, MESSAGE_TYPE_SESSION_BEGIN)) {
-    return false;
+  AppMessageResult result = prv_begin_outbox(&iterator, MESSAGE_TYPE_SESSION_BEGIN);
+  if (result != APP_MSG_OK) {
+    return result;
   }
 
-  if (app_message_outbox_send() != APP_MSG_OK) {
-    return false;
+  result = app_message_outbox_send();
+  if (result != APP_MSG_OK) {
+    return result;
   }
 
   s_app.outbox_message = OUTBOX_SESSION_BEGIN;
-  return true;
+  return APP_MSG_OK;
 }
 
 static void prv_try_send_session_end(void) {
@@ -325,16 +339,16 @@ static bool prv_send_chunk(size_t length) {
   return true;
 }
 
-static void prv_handoff_timeout(void *context) {
+static void prv_transcript_delivery_timeout(void *context) {
   (void)context;
-  s_app.handoff_timer = NULL;
-  prv_fail(STATUS_TRANSFER);
+  s_app.transcript_delivery_timer = NULL;
+  prv_fail(STATUS_ERROR_TRANSCRIPT_DELIVERY_TIMEOUT);
 }
 
-static void prv_bridge_timeout(void *context) {
+static void prv_ws_request_timeout(void *context) {
   (void)context;
-  s_app.bridge_timer = NULL;
-  prv_fail(STATUS_TRANSFER);
+  s_app.ws_request_timer = NULL;
+  prv_fail(STATUS_ERROR_WS_REQUEST_TIMEOUT);
 }
 
 static void prv_exit_after_error(void *context) {
@@ -351,7 +365,7 @@ static void prv_send_next_chunk(void) {
 
   const size_t length = prv_next_chunk_length(s_app.next_chunk_offset);
   if (length == 0 || !prv_send_chunk(length)) {
-    prv_fail(STATUS_TRANSFER);
+    prv_fail(STATUS_ERROR_TRANSFER);
   }
 }
 
@@ -365,8 +379,8 @@ static void prv_fail(AppStatusCode status) {
   s_app.state = APP_STATE_ERROR;
   s_app.terminal_status = status;
 
-  prv_cancel_timer(&s_app.handoff_timer);
-  prv_cancel_timer(&s_app.bridge_timer);
+  prv_cancel_timer(&s_app.transcript_delivery_timer);
+  prv_cancel_timer(&s_app.ws_request_timer);
 
   if (s_app.dictation_active && s_app.dictation) {
     dictation_session_stop(s_app.dictation);
@@ -388,13 +402,13 @@ static void prv_fail(AppStatusCode status) {
 
 static void prv_complete_success(void) {
   if (s_app.state != APP_STATE_AWAITING_SERVER_ACK) {
-    prv_fail(STATUS_PROTOCOL);
+    prv_fail(STATUS_ERROR_PROTOCOL);
     return;
   }
 
   s_app.state = APP_STATE_SUCCESS;
-  prv_cancel_timer(&s_app.handoff_timer);
-  prv_cancel_timer(&s_app.bridge_timer);
+  prv_cancel_timer(&s_app.transcript_delivery_timer);
+  prv_cancel_timer(&s_app.ws_request_timer);
   prv_cancel_timer(&s_app.exit_timer);
   prv_free_transcript();
   window_stack_pop_all(false);
@@ -466,7 +480,7 @@ static void prv_inbox_received(DictionaryIterator *iterator, void *context) {
 
   const Tuple *request_id = dict_find(iterator, MESSAGE_KEY_REQUEST_ID);
   if (!request_id) {
-    prv_fail(STATUS_PROTOCOL);
+    prv_fail(STATUS_ERROR_PROTOCOL);
     return;
   }
   if (!prv_request_id_matches(request_id)) {
@@ -480,28 +494,28 @@ static void prv_inbox_received(DictionaryIterator *iterator, void *context) {
       version != PROTOCOL_VERSION_VALUE ||
       !prv_tuple_to_uint32(dict_find(iterator, MESSAGE_KEY_MESSAGE_TYPE),
                            &message_type)) {
-    prv_fail(STATUS_PROTOCOL);
+    prv_fail(STATUS_ERROR_PROTOCOL);
     return;
   }
 
   switch (message_type) {
     case MESSAGE_TYPE_SEND_STARTED:
       if (s_app.state != APP_STATE_AWAITING_SEND_START) {
-        prv_fail(STATUS_PROTOCOL);
+        prv_fail(STATUS_ERROR_PROTOCOL);
         return;
       }
-      prv_cancel_timer(&s_app.handoff_timer);
+      prv_cancel_timer(&s_app.transcript_delivery_timer);
       s_app.state = APP_STATE_AWAITING_SERVER_ACK;
-      s_app.bridge_timer = app_timer_register(
-          BRIDGE_LIVENESS_TIMEOUT_MS, prv_bridge_timeout, NULL);
-      if (!s_app.bridge_timer) {
-        prv_fail(STATUS_TRANSFER);
+      s_app.ws_request_timer = app_timer_register(
+          WS_REQUEST_TIMEOUT_MS, prv_ws_request_timeout, NULL);
+      if (!s_app.ws_request_timer) {
+        prv_fail(STATUS_ERROR_TRANSFER);
       }
       return;
 
     case MESSAGE_TYPE_REMOTE_ACK:
       if (s_app.state != APP_STATE_AWAITING_SERVER_ACK) {
-        prv_fail(STATUS_PROTOCOL);
+        prv_fail(STATUS_ERROR_PROTOCOL);
         return;
       }
       prv_complete_success();
@@ -511,8 +525,8 @@ static void prv_inbox_received(DictionaryIterator *iterator, void *context) {
       uint32_t status;
       if (!prv_tuple_to_uint32(dict_find(iterator, MESSAGE_KEY_STATUS_CODE),
                                &status) ||
-          status == STATUS_NORMAL || status > STATUS_ACK_TIMEOUT) {
-        prv_fail(STATUS_PROTOCOL);
+          status == STATUS_NORMAL || status > STATUS_ERROR_ACK_TIMEOUT) {
+        prv_fail(STATUS_ERROR_PROTOCOL);
         return;
       }
       prv_fail((AppStatusCode)status);
@@ -520,14 +534,14 @@ static void prv_inbox_received(DictionaryIterator *iterator, void *context) {
     }
 
     default:
-      prv_fail(STATUS_PROTOCOL);
+      prv_fail(STATUS_ERROR_PROTOCOL);
   }
 }
 
 static void prv_inbox_dropped(AppMessageResult reason, void *context) {
   (void)context;
   APP_LOG(APP_LOG_LEVEL_ERROR, "Inbox dropped: %d", reason);
-  prv_fail(STATUS_TRANSFER);
+  prv_fail(STATUS_ERROR_TRANSFER);
 }
 
 static void prv_outbox_sent(DictionaryIterator *iterator, void *context) {
@@ -550,7 +564,7 @@ static void prv_outbox_sent(DictionaryIterator *iterator, void *context) {
 
     case OUTBOX_TRANSCRIPT_CHUNK:
       if (s_app.state != APP_STATE_TRANSFERRING) {
-        prv_fail(STATUS_PROTOCOL);
+        prv_fail(STATUS_ERROR_PROTOCOL);
         return;
       }
 
@@ -565,10 +579,10 @@ static void prv_outbox_sent(DictionaryIterator *iterator, void *context) {
 
       prv_free_transcript();
       s_app.state = APP_STATE_AWAITING_SEND_START;
-      s_app.handoff_timer =
-          app_timer_register(HANDOFF_TIMEOUT_MS, prv_handoff_timeout, NULL);
-      if (!s_app.handoff_timer) {
-        prv_fail(STATUS_TRANSFER);
+      s_app.transcript_delivery_timer =
+          app_timer_register(TRANSCRIPT_DELIVERY_TIMEOUT_MS, prv_transcript_delivery_timeout, NULL);
+      if (!s_app.transcript_delivery_timer) {
+        prv_fail(STATUS_ERROR_TRANSFER);
       }
       break;
 
@@ -594,8 +608,8 @@ static void prv_outbox_failed(DictionaryIterator *iterator,
     return;
   }
 
-  prv_fail((reason & APP_MSG_NOT_CONNECTED) != 0 ? STATUS_CONNECTIVITY
-                                                 : STATUS_TRANSFER);
+  prv_fail((reason & APP_MSG_NOT_CONNECTED) != 0 ? STATUS_ERROR_PHONE_CONNECTIVITY
+                                                 : STATUS_ERROR_TRANSFER);
 }
 
 static void prv_dictation_status(DictationSession *session,
@@ -615,10 +629,10 @@ static void prv_dictation_status(DictationSession *session,
         prv_fail(STATUS_CANCELLED);
         break;
       case DictationSessionStatusFailureNoSpeechDetected:
-        prv_fail(STATUS_NO_SPEECH);
+        prv_fail(STATUS_ERROR_NO_SPEECH);
         break;
       case DictationSessionStatusFailureConnectivityError:
-        prv_fail(STATUS_CONNECTIVITY);
+        prv_fail(STATUS_ERROR_PHONE_CONNECTIVITY);
         break;
       case DictationSessionStatusFailureDisabled:
       case DictationSessionStatusFailureTranscriptionRejectedWithError:
@@ -626,27 +640,27 @@ static void prv_dictation_status(DictationSession *session,
       case DictationSessionStatusFailureInternalError:
       case DictationSessionStatusFailureRecognizerError:
       default:
-        prv_fail(STATUS_DICTATION);
+        prv_fail(STATUS_ERROR_DICTATION);
         break;
     }
     return;
   }
 
   if (!transcription || transcription[0] == '\0') {
-    prv_fail(STATUS_NO_SPEECH);
+    prv_fail(STATUS_ERROR_NO_SPEECH);
     return;
   }
 
   s_app.transcript_bytes = strlen(transcription);
   s_app.transcript = malloc(s_app.transcript_bytes + 1);
   if (!s_app.transcript) {
-    prv_fail(STATUS_TRANSFER);
+    prv_fail(STATUS_ERROR_TRANSFER);
     return;
   }
   memcpy(s_app.transcript, transcription, s_app.transcript_bytes + 1);
 
   if (!prv_prepare_chunks()) {
-    prv_fail(STATUS_TRANSFER);
+    prv_fail(STATUS_ERROR_TRANSFER);
     return;
   }
 
@@ -729,29 +743,34 @@ static bool prv_init(void) {
 
   const uint32_t inbox_size = app_message_inbox_size_maximum();
   s_app.outbox_size = app_message_outbox_size_maximum();
-  if (app_message_open(inbox_size, s_app.outbox_size) != APP_MSG_OK) {
-    prv_fail(STATUS_CONNECTIVITY);
-    return true;
+
+  AppMessageResult result = app_message_open(inbox_size, s_app.outbox_size);
+  if(result & APP_MSG_NOT_CONNECTED) {
+    prv_fail(STATUS_ERROR_PHONE_CONNECTIVITY);
+  } else if(result != APP_MSG_OK) {
+    prv_fail(STATUS_ERROR_TRANSFER);
   }
   s_app.app_message_ready = true;
 
   s_app.dictation = dictation_session_create(0, prv_dictation_status, NULL);
   if (!s_app.dictation) {
-    prv_fail(STATUS_DICTATION);
+    prv_fail(STATUS_ERROR_DICTATION);
     return true;
   }
   dictation_session_enable_confirmation(s_app.dictation, false);
   dictation_session_enable_error_dialogs(s_app.dictation, false);
 
   s_app.state = APP_STATE_DICTATING;
-  if (!prv_send_session_begin()) {
-    prv_fail(STATUS_CONNECTIVITY);
-    return true;
+  result = prv_send_session_begin();
+  if(result & APP_MSG_NOT_CONNECTED) {
+    prv_fail(STATUS_ERROR_PHONE_CONNECTIVITY);
+  } else if(result != APP_MSG_OK) {
+    prv_fail(STATUS_ERROR_TRANSFER);
   }
 
   if (dictation_session_start(s_app.dictation) !=
       DictationSessionStatusSuccess) {
-    prv_fail(STATUS_DICTATION);
+    prv_fail(STATUS_ERROR_DICTATION);
     return true;
   }
   s_app.dictation_active = true;
@@ -760,8 +779,8 @@ static bool prv_init(void) {
 
 static void prv_deinit(void) {
   s_app.shutting_down = true;
-  prv_cancel_timer(&s_app.handoff_timer);
-  prv_cancel_timer(&s_app.bridge_timer);
+  prv_cancel_timer(&s_app.transcript_delivery_timer);
+  prv_cancel_timer(&s_app.ws_request_timer);
   prv_cancel_timer(&s_app.exit_timer);
 
   if (s_app.dictation_active && s_app.dictation) {
