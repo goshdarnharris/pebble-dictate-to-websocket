@@ -122,7 +122,7 @@ function createHarness() {
       clearTimeout: timers.clearTimeout.bind(timers)
     },
     handoffTimeoutMs: 2000,
-    resultTimeoutMs: 20000,
+    resultTimeoutMs: 60000,
     appMessageTransport: transport,
     onClose: function() {
       closed = true;
@@ -219,7 +219,7 @@ function testResultTimeoutQueuesAfterSendStarted() {
   var harness = createHarness();
   harness.socket.open();
   harness.session.handleWatchMessage(transcriptChunk('hello'));
-  harness.timers.fire(20000);
+  harness.timers.fire(60000);
 
   assert.strictEqual(harness.appMessages.sent.length, 1);
   harness.appMessages.succeed();

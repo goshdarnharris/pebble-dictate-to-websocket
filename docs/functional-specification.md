@@ -163,6 +163,14 @@ responsibility.
 5. The watch displays a `Success` or `Failure` heading and the server's response
   for three seconds, then closes.
 
+When a complete result becomes visible, `success: true` produces one short
+vibration and `success: false` produces three short vibrations. Bridge and
+protocol errors do not use these result vibrations.
+
+When the result becomes visible, the watchapp triggers the backlight for the
+system's standard auto-off interval while respecting the user's backlight
+setting.
+
 The result body is vertically scrollable with the UP and DOWN buttons when it
 does not fit on the Emery display. Any result-screen button press cancels the
 three-second close timer. UP and DOWN retain their normal scrolling behavior
@@ -174,8 +182,11 @@ call to `WebSocket.send()`.
 
 ### 6.2 Failure and cancellation flow
 
-The app displays a concise status for three seconds and then closes. The
-implementation must distinguish at least these user-facing categories:
+The app displays a concise status for three seconds and then closes.
+When the status becomes visible, the watchapp triggers the backlight using the
+same standard system behavior as the result screen.
+
+The implementation must distinguish at least these user-facing categories:
 
 | Category | Example display | Causes |
 | --- | --- | --- |
@@ -552,7 +563,7 @@ display.
 
 ### 10.2 Remote server-result deadline
 
-- Duration: 20,000 ms.
+- Duration: 60,000 ms.
 - Authoritative start point: immediately after `WebSocket.send()` successfully
   accepts the request without throwing.
 - Authoritative owner: the PebbleKit JS WebSocket bridge.
@@ -561,14 +572,14 @@ display.
 - Failure conditions: timer expiry, a matching server error, WebSocket error,
   WebSocket close, or a malformed correlated frame before the result.
 
-After receiving `SEND_STARTED`, the watch phone/server bridge starts a 22,000
+After receiving `SEND_STARTED`, the watch phone/server bridge starts a 62,000
 ms liveness guard. This guard is deliberately longer and is not the server
 deadline: the PebbleKit JS timer remains authoritative and has time to deliver
-`FAILURE` after its 20-second timer fires.
+`FAILURE` after its 60-second timer fires.
 
 On PebbleKit JS timeout, it sends `FAILURE` with
 `STATUS_SERVER_RESULT_TIMEOUT`. If neither a result chunk nor `FAILURE` reaches
-the watch before its 22-second guard, the watch shows `WS request timed out`,
+the watch before its 62-second guard, the watch shows `WS request timed out`,
 sends best-effort `SESSION_END`, and exits after the error display.
 
 ### 10.3 Result-chunk inactivity deadline
@@ -580,7 +591,7 @@ sends best-effort `SESSION_END`, and exits after the error display.
 - Success condition: the final valid result chunk completes reassembly.
 - Failure condition: timer expiry while the result is incomplete.
 
-The first result chunk cancels the 22-second phone/server guard. A stalled
+The first result chunk cancels the 62-second phone/server guard. A stalled
 reverse transfer shows `Result timed out`, sends best-effort `SESSION_END`, and
 exits after the error display.
 
@@ -701,11 +712,12 @@ final application result. Bridge failures always use local status text.
 
 ### 13.3 Result and timing
 
-13. A matching result received within 20 seconds of `WebSocket.send()` is
+13. A matching result received within 60 seconds of `WebSocket.send()` is
   transferred to the watch and displayed for three seconds unless the user
   presses a button.
 14. Both `success: true` and `success: false` are completed application results
-  with `Success` or `Failure` headings respectively.
+  with `Success` or `Failure` headings and one or three short vibrations,
+  respectively.
 15. AppMessage outbox success and `WebSocket.send()` success alone do not close
   or claim success.
 16. An immediate synchronous result is still queued behind `SEND_STARTED`.
@@ -715,7 +727,7 @@ final application result. Bridge failures always use local status text.
 18. A matching server error produces a three-second local delivery error.
 19. Lack of `SEND_STARTED` within two seconds of final transcript-chunk delivery
   produces a three-second delivery error.
-20. A 20-second server-result expiry reaches the watch before its 22-second
+20. A 60-second server-result expiry reaches the watch before its 62-second
   liveness guard under normal bridge operation.
 21. A result transfer that stalls for three seconds between valid chunks shows
   a result-transfer timeout.

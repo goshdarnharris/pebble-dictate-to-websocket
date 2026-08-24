@@ -26,9 +26,10 @@ The server must return a matching final result within 20 seconds:
 
 `response` must contain at most 1,024 UTF-8 bytes. PebbleKit JS divides it into
 UTF-8-safe AppMessage chunks, and the watch shows it under a `Success` or
-`Failure` heading for three seconds. Pressing any button cancels automatic
-close; UP and DOWN continue scrolling, and BACK exits manually. Protocol-v1
-`ack` servers are not compatible.
+`Failure` heading for three seconds, with one short vibration for success or
+three for failure. Pressing any button cancels automatic close; UP and DOWN
+continue scrolling, and BACK exits manually. Protocol-v1 `ack` servers are not
+compatible.
 
 ## Run the example server
 

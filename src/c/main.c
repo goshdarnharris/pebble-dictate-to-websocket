@@ -159,7 +159,7 @@ static void prv_bridge_init(BridgeContext *bridge) {
   bridge->watch_phone.result_chunk_timeout.duration_ms = 3000;
   bridge->phone_server.state = PHONE_SERVER_BRIDGE_STATE_IDLE;
   bridge->phone_server.error = PHONE_SERVER_BRIDGE_ERROR_NONE;
-  bridge->phone_server.request_timeout.duration_ms = 22000;
+  bridge->phone_server.request_timeout.duration_ms = 62000;
 }
 
 static void prv_cancel_bridge_timeout(BridgeTimeout *timeout) {
@@ -542,6 +542,19 @@ static void prv_destroy_result_layers(void) {
 
 static void prv_result_click_config_provider(void *context);
 
+static void prv_vibrate_for_server_result(bool success) {
+  if (success) {
+    vibes_short_pulse();
+    return;
+  }
+
+  static const uint32_t segments[] = {200, 100, 200, 100, 200};
+  vibes_enqueue_custom_pattern((VibePattern){
+      .durations = segments,
+      .num_segments = ARRAY_LENGTH(segments),
+  });
+}
+
 static bool prv_show_server_result(void) {
   WatchPhoneBridgeContext *bridge = &s_app.bridge.watch_phone;
   Layer *root_layer = window_get_root_layer(s_app.window);
@@ -614,6 +627,7 @@ static bool prv_show_server_result(void) {
     return false;
   }
   s_app.state = APP_STATE_DISPLAYING_RESULT;
+  light_enable_interaction();
   return true;
 }
 
@@ -690,6 +704,7 @@ static bool prv_receive_server_result_chunk(DictionaryIterator *iterator) {
     bridge->server_response[bridge->server_response_bytes] = '\0';
     bridge->state = WATCH_PHONE_BRIDGE_STATE_COMPLETE;
     prv_cancel_bridge_timeout(&bridge->result_chunk_timeout);
+    prv_vibrate_for_server_result(bridge->server_success);
     if (!prv_show_server_result()) {
       bridge->error = WATCH_PHONE_BRIDGE_ERROR_TRANSFER;
       return false;
@@ -756,6 +771,7 @@ static void prv_fail(AppStatusCode status) {
   s_app.bridge.watch_phone.session_end_pending = true;
   prv_try_send_session_end();
   prv_set_status(prv_status_text(status));
+  light_enable_interaction();
 
   prv_cancel_timer(&s_app.exit_timer);
   s_app.exit_timer =
@@ -872,6 +888,7 @@ static void prv_inbox_received(DictionaryIterator *iterator, void *context) {
       if (!timeout->timer) {
         prv_watch_phone_fail(WATCH_PHONE_BRIDGE_ERROR_TRANSFER);
       }
+      prv_set_status("Thinking...");
       return;
 
     case MESSAGE_TYPE_SERVER_RESULT_CHUNK:

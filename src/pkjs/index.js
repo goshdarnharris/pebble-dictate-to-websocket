@@ -7,7 +7,7 @@ var watchModule = require('./watch_bridge');
 // Change this build-time value to the WebSocket server reachable by the phone.
 var WEBSOCKET_URL = 'ws://192.168.50.199:8080/';
 var WS_REQUEST_TIMEOUT_MS = 2000;
-var SERVER_RESULT_TIMEOUT_MS = 20000;
+var SERVER_RESULT_TIMEOUT_MS = 60000;
 
 var activeSession = null;
 var appMessageTransport = new watchModule.AppMessageTransport(
