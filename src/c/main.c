@@ -7,6 +7,8 @@
 #include <string.h>
 #include <time.h>
 
+#include "message_dialog.h"
+
 #define PROTOCOL_VERSION_VALUE 2
 #define ERROR_DISPLAY_MS 5000
 #define REQUEST_ID_LENGTH 8
@@ -123,10 +125,7 @@ typedef struct {
 
 typedef struct {
   Window *window;
-  TextLayer *status_layer;
-  TextLayer *result_heading_layer;
-  TextLayer *result_text_layer;
-  ScrollLayer *result_scroll_layer;
+  MessageDialog *message_dialog;
   DictationSession *dictation;
   AppTimer *exit_timer;
   BridgeContext bridge;
@@ -151,6 +150,7 @@ static AppContext s_app;
 static void prv_fail(AppStatusCode status);
 static void prv_send_next_chunk(void);
 static bool prv_tuple_to_uint32(const Tuple *tuple, uint32_t *value);
+static void prv_click_config_provider(void *context);
 
 static void prv_bridge_init(BridgeContext *bridge) {
   bridge->watch_phone.state = WATCH_PHONE_BRIDGE_STATE_IDLE;
@@ -222,36 +222,36 @@ static void prv_phone_server_fail(PhoneServerBridgeError error) {
 }
 
 static void prv_set_status(const char *text) {
-  if (s_app.status_layer) {
-    text_layer_set_text(s_app.status_layer, text);
-  }
+  message_dialog_show_status(
+      s_app.message_dialog, text, MESSAGE_DIALOG_TONE_PROGRESS,
+      MESSAGE_DIALOG_ICON_WORKING, true, NULL, NULL);
 }
 
 static const char *prv_status_text(AppStatusCode status) {
   switch (status) {
     case STATUS_CANCELLED:
-      return "Dictation\ncancelled";
+      return "Dictation cancelled";
     case STATUS_ERROR_DICTATION:
-      return "Dictation\nerror";
+      return "Dictation error";
     case STATUS_ERROR_NO_SPEECH:
-      return "No speech\nheard";
+      return "No speech heard";
     case STATUS_ERROR_PHONE_CONNECTIVITY:
-      return "Phone\nunavailable";
+      return "Phone unavailable";
     case STATUS_ERROR_SERVER_RESULT_TIMEOUT:
-      return "WS server\ntimed out";
+      return "WS server timed out";
     case STATUS_ERROR_PROTOCOL:
     case STATUS_ERROR_TRANSFER:
     case STATUS_ERROR_SERVER:
-      return "Delivery\nfailed";
+      return "Delivery failed";
     case STATUS_ERROR_TRANSCRIPT_DELIVERY_TIMEOUT:
-      return "Delivery\ntimed out";
+      return "Delivery timed out";
     case STATUS_ERROR_RESULT_TRANSFER_TIMEOUT:
-      return "Result\ntimed out";
+      return "Result timed out";
     case STATUS_ERROR_WS_REQUEST_TIMEOUT:
-      return "WS request\ntimed out";
+      return "WS request timed out";
     case STATUS_NORMAL:
     default:
-      return "Unknown\nerror";
+      return "Unknown error";
   }
 }
 
@@ -525,21 +525,6 @@ static bool prv_valid_utf8(const char *text, size_t bytes) {
   return true;
 }
 
-static void prv_destroy_result_layers(void) {
-  if (s_app.result_text_layer) {
-    text_layer_destroy(s_app.result_text_layer);
-    s_app.result_text_layer = NULL;
-  }
-  if (s_app.result_scroll_layer) {
-    scroll_layer_destroy(s_app.result_scroll_layer);
-    s_app.result_scroll_layer = NULL;
-  }
-  if (s_app.result_heading_layer) {
-    text_layer_destroy(s_app.result_heading_layer);
-    s_app.result_heading_layer = NULL;
-  }
-}
-
 static void prv_result_click_config_provider(void *context);
 
 static void prv_vibrate_for_server_result(bool success) {
@@ -557,73 +542,15 @@ static void prv_vibrate_for_server_result(bool success) {
 
 static bool prv_show_server_result(void) {
   WatchPhoneBridgeContext *bridge = &s_app.bridge.watch_phone;
-  Layer *root_layer = window_get_root_layer(s_app.window);
-  const GRect bounds = layer_get_bounds(root_layer);
-  const int16_t margin = 8;
-  const int16_t heading_height = 42;
-  const int16_t text_measurement_height = 2000;
-  const GRect scroll_frame = GRect(
-      margin, heading_height, bounds.size.w - margin * 2,
-      bounds.size.h - heading_height - margin);
-
-  s_app.result_heading_layer = text_layer_create(
-      GRect(0, 4, bounds.size.w, heading_height - 4));
-  s_app.result_scroll_layer = scroll_layer_create(scroll_frame);
-  s_app.result_text_layer = text_layer_create(
-      GRect(0, 0, scroll_frame.size.w, text_measurement_height));
-  if (!s_app.result_heading_layer || !s_app.result_scroll_layer ||
-      !s_app.result_text_layer) {
-    prv_destroy_result_layers();
+  if (!message_dialog_show_result(
+      s_app.message_dialog, s_app.window, bridge->server_response,
+      bridge->server_success,
+          prv_result_click_config_provider)) {
     return false;
   }
-
-  text_layer_set_background_color(s_app.result_heading_layer, GColorClear);
-  text_layer_set_text_color(s_app.result_heading_layer, GColorWhite);
-  text_layer_set_font(s_app.result_heading_layer,
-                      fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
-  text_layer_set_text_alignment(s_app.result_heading_layer,
-                                GTextAlignmentCenter);
-  text_layer_set_text(s_app.result_heading_layer,
-                      bridge->server_success ? "Success" : "Failure");
-
-  text_layer_set_background_color(s_app.result_text_layer, GColorClear);
-  text_layer_set_text_color(s_app.result_text_layer, GColorWhite);
-  text_layer_set_font(s_app.result_text_layer,
-                      fonts_get_system_font(FONT_KEY_GOTHIC_18));
-  text_layer_set_overflow_mode(s_app.result_text_layer,
-                               GTextOverflowModeWordWrap);
-  text_layer_set_text(s_app.result_text_layer, bridge->server_response);
-  GSize content_size = text_layer_get_content_size(s_app.result_text_layer);
-  if (content_size.h < scroll_frame.size.h) {
-    content_size.h = scroll_frame.size.h;
-  }
-  layer_set_frame(text_layer_get_layer(s_app.result_text_layer),
-                  GRect(0, 0, scroll_frame.size.w, content_size.h));
-  scroll_layer_add_child(s_app.result_scroll_layer,
-                         text_layer_get_layer(s_app.result_text_layer));
-  scroll_layer_set_content_size(
-      s_app.result_scroll_layer,
-      GSize(scroll_frame.size.w, content_size.h));
-  scroll_layer_set_content_offset(s_app.result_scroll_layer, GPointZero,
-                                  false);
-  scroll_layer_set_callbacks(
-      s_app.result_scroll_layer,
-      (ScrollLayerCallbacks){
-          .click_config_provider = prv_result_click_config_provider,
-      });
-  scroll_layer_set_click_config_onto_window(s_app.result_scroll_layer,
-                                             s_app.window);
-
-  layer_set_hidden(text_layer_get_layer(s_app.status_layer), true);
-  layer_add_child(root_layer,
-                  text_layer_get_layer(s_app.result_heading_layer));
-  layer_add_child(root_layer,
-                  scroll_layer_get_layer(s_app.result_scroll_layer));
   s_app.exit_timer = app_timer_register(
       ERROR_DISPLAY_MS, prv_exit_after_error, NULL);
   if (!s_app.exit_timer) {
-    layer_set_hidden(text_layer_get_layer(s_app.status_layer), false);
-    prv_destroy_result_layers();
     return false;
   }
   s_app.state = APP_STATE_DISPLAYING_RESULT;
@@ -747,6 +674,21 @@ static void prv_send_next_chunk(void) {
   }
 }
 
+static void prv_terminal_status_visible(void *context) {
+  (void)context;
+  if (s_app.state != APP_STATE_ERROR || s_app.shutting_down) {
+    return;
+  }
+
+  light_enable_interaction();
+  prv_cancel_timer(&s_app.exit_timer);
+  s_app.exit_timer =
+      app_timer_register(ERROR_DISPLAY_MS, prv_exit_after_error, NULL);
+  if (!s_app.exit_timer) {
+    window_stack_pop_all(false);
+  }
+}
+
 static void prv_fail(AppStatusCode status) {
   if (s_app.shutting_down || s_app.state == APP_STATE_ERROR ||
   s_app.state == APP_STATE_DISPLAYING_RESULT) {
@@ -770,15 +712,11 @@ static void prv_fail(AppStatusCode status) {
   prv_free_server_response();
   s_app.bridge.watch_phone.session_end_pending = true;
   prv_try_send_session_end();
-  prv_set_status(prv_status_text(status));
-  light_enable_interaction();
-
-  prv_cancel_timer(&s_app.exit_timer);
-  s_app.exit_timer =
-      app_timer_register(ERROR_DISPLAY_MS, prv_exit_after_error, NULL);
-  if (!s_app.exit_timer) {
-    window_stack_pop_all(false);
-  }
+  window_set_click_config_provider(s_app.window, prv_click_config_provider);
+  message_dialog_show_status(
+      s_app.message_dialog, prv_status_text(status),
+      MESSAGE_DIALOG_TONE_FAILURE, MESSAGE_DIALOG_ICON_WARNING, true,
+      prv_terminal_status_visible, NULL);
 }
 
 static bool prv_tuple_to_uint32(const Tuple *tuple, uint32_t *value) {
@@ -1140,32 +1078,17 @@ static void prv_window_load(Window *window) {
   Layer *root_layer = window_get_root_layer(window);
   const GRect bounds = layer_get_bounds(root_layer);
 
-  const int16_t status_height = 80;
-  const int16_t status_y = (bounds.size.h - status_height) / 2;
-  s_app.status_layer = text_layer_create(
-      GRect(0, status_y, bounds.size.w, status_height));
-  if (!s_app.status_layer) {
+  s_app.message_dialog =
+      message_dialog_create(root_layer, bounds, "Starting...");
+  if (!s_app.message_dialog) {
     s_app.initialization_failed = true;
-    return;
   }
-
-  text_layer_set_background_color(s_app.status_layer, GColorClear);
-  text_layer_set_text_color(s_app.status_layer, GColorWhite);
-  text_layer_set_font(s_app.status_layer,
-                      fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
-  text_layer_set_text_alignment(s_app.status_layer, GTextAlignmentCenter);
-  text_layer_set_overflow_mode(s_app.status_layer, GTextOverflowModeWordWrap);
-  text_layer_set_text(s_app.status_layer, "Starting...");
-  layer_add_child(root_layer, text_layer_get_layer(s_app.status_layer));
 }
 
 static void prv_window_unload(Window *window) {
   (void)window;
-  prv_destroy_result_layers();
-  if (s_app.status_layer) {
-    text_layer_destroy(s_app.status_layer);
-  }
-  s_app.status_layer = NULL;
+  message_dialog_destroy(s_app.message_dialog);
+  s_app.message_dialog = NULL;
 }
 
 static bool prv_init(void) {

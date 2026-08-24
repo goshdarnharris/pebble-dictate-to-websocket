@@ -158,8 +158,9 @@ responsibility.
 2. Native dictation appears immediately and handles listening and
    transcription.
 3. After a successful transcription, the watchapp shows `Sending...`.
-4. While the server processes the request, the watchapp continues to show
-  `Sending...` for up to the server-result deadline.
+4. Once PebbleKit JS reports that the WebSocket send has started, the watchapp
+  shows `Thinking...` while the server processes the request, for up to the
+  server-result deadline.
 5. The watch displays a `Success` or `Failure` heading and the server's response
   for five seconds, then closes.
 
